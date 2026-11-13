@@ -1,52 +1,49 @@
-from collections.abc import Callable
-from typing import Literal
+"""Tool registry — collects MCP-conformant ToolDefinitions from each module."""
 
-from pydantic import BaseModel
+from typing import Any
 
-from .calculator import CalculatorInput, CalculatorOutput, calculator
-from .get_current_time import GetCurrentTimeInput, GetCurrentTimeOutput, get_current_time
-from .get_timezone_offset import GetTimezoneOffsetInput, GetTimezoneOffsetOutput, get_timezone_offset
+from .definition import Assertion, Extractor, ToolDefinition
+from .calculator import TOOL as _calculator
+from .dice_roller import TOOL as _dice_roller
+from .get_current_time import TOOL as _get_current_time
+from .get_timezone_offset import TOOL as _get_timezone_offset
+from .string_tools import HASH_TOOL as _hash_string, BASE64_TOOL as _base64_encode
+from .unit_converter import TOOL as _unit_converter
+from .word_counter import TOOL as _word_counter
 
-Assertion = tuple[str, Literal["exact", "numeric", "temporal"]]
-Extractor = Callable[[str], list[Assertion]]
+ALL_TOOLS: list[ToolDefinition] = [
+    _get_timezone_offset,
+    _get_current_time,
+    _calculator,
+    _unit_converter,
+    _word_counter,
+    _dice_roller,
+    _hash_string,
+    _base64_encode,
+]
 
-SANDBOX_FUNCTIONS: dict[str, Callable] = {
-    "get_timezone_offset": get_timezone_offset,
-    "get_current_time": get_current_time,
-    "calculator": calculator,
-}
-
-
-def _calculator_extractor(output: str) -> list[Assertion]:
-    if output.startswith("error:"):
-        return [(output, "exact")]
-    return [(output, "numeric")]
-
-
-def _time_extractor(output: str) -> list[Assertion]:
-    return [(output, "temporal")]
+TOOLS_BY_NAME: dict[str, ToolDefinition] = {t.name: t for t in ALL_TOOLS}
 
 
-def _timezone_extractor(output: str) -> list[Assertion]:
-    return [(output, "exact")]
+def mcp_list_tools() -> list[dict[str, Any]]:
+    """Return tool definitions in MCP tools/list response format."""
+    return [
+        {
+            "name": t.name,
+            "description": t.description,
+            "inputSchema": t.inputSchema,
+        }
+        for t in ALL_TOOLS
+    ]
 
 
+# Backwards-compat aliases used by sandbox.py, causality.py, faithfulness.py
+SANDBOX_FUNCTIONS: dict[str, callable] = {t.name: t.fn for t in ALL_TOOLS}
 TOOL_SCHEMAS: dict[str, dict] = {
-    "get_timezone_offset": {
-        "input": GetTimezoneOffsetInput,
-        "output": GetTimezoneOffsetOutput,
-        "depends_on": [],
-    },
-    "get_current_time": {
-        "input": GetCurrentTimeInput,
-        "output": GetCurrentTimeOutput,
-        "extractor": _time_extractor,
-        "depends_on": ["get_timezone_offset"],
-    },
-    "calculator": {
-        "input": CalculatorInput,
-        "output": CalculatorOutput,
-        "extractor": _calculator_extractor,
-        "depends_on": [],
-    },
+    t.name: {
+        "inputSchema": t.inputSchema,
+        "extractor": t.extractor,
+        "depends_on": t.depends_on,
+    }
+    for t in ALL_TOOLS
 }

@@ -1,18 +1,17 @@
 """Pydantic Monty sandbox — pool management, per-reply sessions, and LangChain
 tool wrappers that execute host functions inside the sandbox."""
 
-import inspect
 import json
 from collections.abc import Callable
 from contextlib import AsyncExitStack
 
 import pydantic_monty as pm
 from langchain_core.tools import BaseTool, StructuredTool
-from pydantic import BaseModel, Field, create_model
+from pydantic import BaseModel, create_model, Field
 
 from AI.models.message import ToolExecutionRecord
 from AI.signing import canonicalize_args, sign_execution
-from AI.tools import SANDBOX_FUNCTIONS
+from AI.tools import ALL_TOOLS, SANDBOX_FUNCTIONS
 
 MAX_TOOL_OUTPUT = 4_000
 
@@ -113,42 +112,37 @@ def _with_stdout(stdout: str, tail: str) -> str:
     return text
 
 
-_PY_TO_PYDANTIC = {
-    str: (str, ...),
-    int: (int, ...),
-    float: (float, ...),
-    bool: (bool, ...),
-}
-
-
-def _schema_for(fn: Callable) -> type[BaseModel]:
-    """Build a Pydantic model from a function's signature for LangChain's args_schema."""
-    sig = inspect.signature(fn)
+def _args_model(json_schema: dict, name: str) -> type[BaseModel]:
+    """Build a Pydantic model from a JSON Schema for LangChain's args_schema."""
+    props = json_schema.get("properties", {})
+    required = set(json_schema.get("required", []))
     fields = {}
-    for name, param in sig.parameters.items():
-        ann = param.annotation if param.annotation is not inspect.Parameter.empty else str
-        if param.default is not inspect.Parameter.empty:
-            fields[name] = (ann, Field(default=param.default))
+    type_map = {"string": str, "integer": int, "number": float, "boolean": bool}
+    for prop_name, prop in props.items():
+        py_type = type_map.get(prop.get("type", "string"), str)
+        desc = prop.get("description", "")
+        if prop_name in required and "default" not in prop:
+            fields[prop_name] = (py_type, Field(..., description=desc))
         else:
-            fields[name] = (ann, Field(...))
-    return create_model(f"{fn.__name__}_args", **fields)
+            fields[prop_name] = (py_type, Field(default=prop.get("default"), description=desc))
+    return create_model(f"{name}_args", **fields)
 
 
 # ── LangChain tools ─────────────────────────────────────────────────────────
 
 def make_tools(sandbox: SandboxSession) -> list[BaseTool]:
-    """Create one LangChain tool per host function, each executing inside the sandbox."""
+    """Create one LangChain tool per ToolDefinition, each executing inside the sandbox."""
     tools: list[BaseTool] = []
-    for name, fn in SANDBOX_FUNCTIONS.items():
+    for defn in ALL_TOOLS:
 
-        async def _run(sandbox=sandbox, func_name=name, **kwargs) -> tuple[str, ToolExecutionRecord]:
+        async def _run(sandbox=sandbox, func_name=defn.name, **kwargs) -> tuple[str, ToolExecutionRecord]:
             return await sandbox.call_signed(func_name, **kwargs)
 
         tools.append(StructuredTool.from_function(
             coroutine=_run,
-            name=name,
-            description=(fn.__doc__ or "").strip(),
-            args_schema=_schema_for(fn),
+            name=defn.name,
+            description=defn.description,
+            args_schema=_args_model(defn.inputSchema, defn.name),
             response_format="content_and_artifact",
         ))
     return tools

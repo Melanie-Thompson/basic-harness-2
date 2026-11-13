@@ -77,40 +77,33 @@ _CHECKERS = {
 def check_faithfulness(
     ai_text: str,
     records: list[ToolExecutionRecord],
-) -> list[FaithfulnessResult]:
-    results: list[FaithfulnessResult] = []
+) -> dict[str | None, FaithfulnessResult]:
+    """Returns a dict keyed by tool_call_id -> FaithfulnessResult."""
+    results: dict[str | None, FaithfulnessResult] = {}
 
     for record in records:
-        score = semantic_similarity(record.tool_output, ai_text)
-
         schema = TOOL_SCHEMAS.get(record.tool_name)
         extractor: Extractor | None = schema.get("extractor") if schema else None
+
+        if extractor is None:
+            continue
+
+        score = semantic_similarity(record.tool_output, ai_text)
 
         contained = True
         mismatches: list[str] = []
 
-        if extractor is not None:
-            for value, kind in extractor(record.tool_output):
-                checker = _CHECKERS.get(kind, _check_exact)
-                if not checker(value, ai_text):
-                    contained = False
-                    mismatches.append(f"{kind}:{value}")
+        for value, kind in extractor(record.tool_output):
+            checker = _CHECKERS.get(kind, _check_exact)
+            if not checker(value, ai_text):
+                contained = False
+                mismatches.append(f"{kind}:{value}")
 
-        # Extractor containment overrides a low semantic score (handles
-        # multi-tool responses where BERT compares against the full text).
-        # But a low semantic score with no extractor means the response is
-        # off-topic entirely.
-        if extractor is not None:
-            faithful = contained
-        else:
-            faithful = score >= SEMANTIC_THRESHOLD
-
-        results.append(FaithfulnessResult(
-            tool_name=record.tool_name,
+        results[record.tool_call_id] = FaithfulnessResult(
             semantic_score=score,
             contained=contained,
-            faithful=faithful,
+            faithful=contained,
             mismatches=mismatches,
-        ))
+        )
 
     return results

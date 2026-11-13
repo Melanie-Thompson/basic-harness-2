@@ -16,15 +16,15 @@ from AI.models import (
     AnyMessage,
     CausalResult,
     FaithfulnessResult,
-    StepResult,
     HumanMessage,
+    InterstitialCheck,
     Session,
     SystemMessage,
     ToolCall,
+    ToolExecution,
     ToolExecutionRecord,
-    ToolMessage,
+    ToolMessage as ModelToolMessage,
 )
-from AI.tools import TOOL_SCHEMAS
 
 _TYPE_TO_ROLE: dict[str, str] = {
     "human": "human",
@@ -43,104 +43,67 @@ _ROLE_TO_LC: dict[str, type[BaseMessage]] = {
 
 
 def _langchain_to_models(messages: list[BaseMessage]) -> list[AnyMessage]:
-    """Convert a list of LangChain messages to typed Pydantic models.
+    """Convert LangChain messages to typed Pydantic models.
 
-    Processes them together so ToolMessages can look up their corresponding
-    AIMessage tool call to populate tool_name, tool_input, and tool_output.
+    Tool messages are omitted — their data is on the preceding AI message's
+    tool_executions. Every AI message is kept: intermediate ones carry
+    tool_executions + causality, the final one carries faithfulness.
     """
-    # Build a map of tool_call_id -> (name, args) from AI messages
-    call_index: dict[str, tuple[str, dict]] = {}
-    for msg in messages:
-        if hasattr(msg, "tool_calls") and msg.tool_calls:
-            for tc in msg.tool_calls:
-                call_index[tc["id"]] = (tc["name"], tc.get("args", {}))
-
     result: list[AnyMessage] = []
     for msg in messages:
         role = _TYPE_TO_ROLE.get(msg.type, "human")
         content = msg.content if isinstance(msg.content, str) else str(msg.content)
 
         if role == "ai":
+            kwargs = getattr(msg, "additional_kwargs", {})
+
+            causality = None
+            raw = kwargs.get("causality")
+            if raw:
+                try:
+                    causality = CausalResult(**raw)
+                except Exception:
+                    pass
+
+            faithfulness = None
+            raw = kwargs.get("faithfulness")
+            if raw:
+                try:
+                    faithfulness = FaithfulnessResult(**raw)
+                except Exception:
+                    pass
+
+            interstitial = None
+            raw = kwargs.get("interstitial")
+            if raw:
+                try:
+                    interstitial = InterstitialCheck(**raw)
+                except Exception:
+                    pass
+
+            tool_executions = None
+            raw = kwargs.get("tool_executions")
+            if raw:
+                try:
+                    tool_executions = [ToolExecution(**e) for e in raw]
+                except Exception:
+                    pass
+
             tool_calls = None
             if hasattr(msg, "tool_calls") and msg.tool_calls:
-                tool_calls = [
-                    ToolCall(
-                        name=tc["name"],
-                        args=tc.get("args", {}),
-                        id=tc.get("id"),
-                        type=tc.get("type", "tool_call"),
-                    )
-                    for tc in msg.tool_calls
-                ]
-            faithfulness = None
-            raw_faith = getattr(msg, "additional_kwargs", {}).get("faithfulness")
-            if raw_faith:
-                try:
-                    faithfulness = [FaithfulnessResult(**r) for r in raw_faith]
-                except Exception:
-                    pass
-            causality = None
-            raw_causal = getattr(msg, "additional_kwargs", {}).get("causality")
-            if raw_causal:
-                try:
-                    causality = CausalResult(**raw_causal)
-                except Exception:
-                    pass
-            step_faithfulness = None
-            raw_steps = getattr(msg, "additional_kwargs", {}).get("step_faithfulness")
-            if raw_steps:
-                try:
-                    step_faithfulness = [StepResult(**s) for s in raw_steps]
-                except Exception:
-                    pass
+                tool_calls = [ToolCall(**tc) for tc in msg.tool_calls]
+
             result.append(AIMessage(
                 content=content,
                 tool_calls=tool_calls,
-                faithfulness=faithfulness,
-                step_faithfulness=step_faithfulness,
+                tool_executions=tool_executions,
                 causality=causality,
+                interstitial=interstitial,
+                faithfulness=faithfulness,
             ))
 
         elif role == "tool":
-            tool_call_id = msg.tool_call_id if hasattr(msg, "tool_call_id") else None
-            tool_name = None
-            tool_input = None
-            tool_output = None
-            execution_record = None
-
-            artifact = getattr(msg, "artifact", None)
-            if isinstance(artifact, ToolExecutionRecord):
-                execution_record = artifact
-            elif isinstance(artifact, dict):
-                try:
-                    execution_record = ToolExecutionRecord(**artifact)
-                except Exception:
-                    pass
-
-            if tool_call_id and tool_call_id in call_index:
-                name, args = call_index[tool_call_id]
-                tool_name = name
-                schema = TOOL_SCHEMAS.get(name)
-                if schema:
-                    tool_input = schema["input"](**args).model_dump()
-                    try:
-                        tool_output = schema["output"](
-                            **{list(schema["output"].model_fields.keys())[0]: content}
-                        ).model_dump()
-                    except Exception:
-                        tool_output = {"raw": content}
-                else:
-                    tool_input = args
-                    tool_output = {"raw": content}
-
-            result.append(ToolMessage(
-                content=content,
-                tool_call_id=tool_call_id,
-                tool_name=tool_name,
-                tool_input=tool_input,
-                tool_output=tool_output,
-                execution_record=execution_record,
-            ))
+            continue
 
         elif role == "system":
             result.append(SystemMessage(content=content))
@@ -154,7 +117,7 @@ def _model_to_langchain(msg: AnyMessage) -> BaseMessage:
     kwargs: dict = {"content": msg.content}
     if isinstance(msg, AIMessage) and msg.tool_calls:
         kwargs["tool_calls"] = [tc.model_dump() for tc in msg.tool_calls]
-    if isinstance(msg, ToolMessage):
+    if isinstance(msg, ModelToolMessage):
         if msg.tool_call_id:
             kwargs["tool_call_id"] = msg.tool_call_id
         if msg.execution_record:

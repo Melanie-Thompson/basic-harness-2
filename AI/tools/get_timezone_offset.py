@@ -3,6 +3,8 @@ from zoneinfo import ZoneInfo, available_timezones
 
 from pydantic import BaseModel, Field
 
+from .definition import ToolDefinition
+
 _ALL_ZONES = available_timezones()
 
 _CITY_TO_ZONE: dict[str, str] = {}
@@ -17,13 +19,8 @@ class GetTimezoneOffsetInput(BaseModel):
     location: str = Field(description="City name or IANA timezone (e.g. 'London', 'Asia/Bahrain', 'New York')")
 
 
-class GetTimezoneOffsetOutput(BaseModel):
-    timezone: str = Field(description="IANA timezone identifier")
-    utc_offset_hours: float = Field(description="Current UTC offset in hours")
-
-
 def get_timezone_offset(location: str) -> str:
-    """Look up the current UTC offset in hours for a city or IANA timezone. Call this BEFORE get_current_time to find the correct offset."""
+    """Look up the current UTC offset for a city or IANA timezone."""
     query = location.strip()
 
     if query in _ALL_ZONES:
@@ -51,3 +48,16 @@ def get_timezone_offset(location: str) -> str:
         return f"Ambiguous: {', '.join(sorted(matches[:10]))}. Be more specific or use an IANA timezone."
 
     return f"Unknown location '{location}'. Use an IANA timezone like 'Europe/London' or a city name."
+
+
+def _extractor(output: str):
+    return [(output, "exact")]
+
+
+TOOL = ToolDefinition(
+    name="get_timezone_offset",
+    description="Look up the current UTC offset for a city or IANA timezone. Call this BEFORE get_current_time to find the correct offset.",
+    inputSchema=GetTimezoneOffsetInput.model_json_schema(),
+    fn=get_timezone_offset,
+    extractor=_extractor,
+)

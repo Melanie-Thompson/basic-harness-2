@@ -14,32 +14,70 @@ class ToolCall(BaseModel):
 
 class ToolExecutionRecord(BaseModel):
     tool_name: str
+    tool_call_id: str | None = None
     tool_input: dict
     tool_output: str
     signature: str
 
 
 class FaithfulnessResult(BaseModel):
-    tool_name: str
     semantic_score: float
     contained: bool
     faithful: bool
     mismatches: list[str] = Field(default_factory=list)
 
 
-class StepResult(BaseModel):
-    step: int
-    tool_called: str
-    preceding_tool: str
-    semantic_score: float
-    faithful: bool
-    detail: str = ""
+class ToolExecution(BaseModel):
+    tool_name: str
+    tool_call_id: str | None = None
+    tool_input: dict = Field(default_factory=dict)
+    tool_output: str = ""
+    signature: str = ""
+    faithfulness: FaithfulnessResult | None = None
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler: Any) -> dict[str, Any]:
+        d = handler(self)
+        if not self.faithfulness:
+            d.pop("faithfulness", None)
+        return d
+
+
+class DataFlowEdge(BaseModel):
+    from_tool: str
+    to_tool: str
+    values: list[str] = Field(default_factory=list)
 
 
 class CausalResult(BaseModel):
     valid: bool
-    tool_sequence: list[str]
     violations: list[str] = Field(default_factory=list)
+    data_flow: list[DataFlowEdge] = Field(default_factory=list)
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler: Any) -> dict[str, Any]:
+        d = handler(self)
+        if not self.violations:
+            d.pop("violations", None)
+        if not self.data_flow:
+            d.pop("data_flow", None)
+        return d
+
+
+class InterstitialCheck(BaseModel):
+    semantic_score: float
+    values_carried: list[str] = Field(default_factory=list)
+    faithful: bool
+    detail: str = ""
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler: Any) -> dict[str, Any]:
+        d = handler(self)
+        if not self.values_carried:
+            d.pop("values_carried", None)
+        if not self.detail:
+            d.pop("detail", None)
+        return d
 
 
 class Message(Meta):
@@ -54,21 +92,17 @@ class HumanMessage(Message):
 class AIMessage(Message):
     role: Literal["ai"] = "ai"
     tool_calls: list[ToolCall] | None = None
-    faithfulness: list[FaithfulnessResult] | None = None
-    step_faithfulness: list[StepResult] | None = None
+    tool_executions: list[ToolExecution] | None = None
     causality: CausalResult | None = None
+    interstitial: InterstitialCheck | None = None
+    faithfulness: FaithfulnessResult | None = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler: Any) -> dict[str, Any]:
         d = handler(self)
-        if not self.tool_calls:
-            d.pop("tool_calls", None)
-        if not self.faithfulness:
-            d.pop("faithfulness", None)
-        if not self.step_faithfulness:
-            d.pop("step_faithfulness", None)
-        if not self.causality:
-            d.pop("causality", None)
+        for key in ("tool_calls", "tool_executions", "causality", "interstitial", "faithfulness"):
+            if not getattr(self, key, None):
+                d.pop(key, None)
         return d
 
 
@@ -76,8 +110,6 @@ class ToolMessage(Message):
     role: Literal["tool"] = "tool"
     tool_call_id: str | None = None
     tool_name: str | None = None
-    tool_input: dict | None = None
-    tool_output: dict | None = None
     execution_record: ToolExecutionRecord | None = None
 
 

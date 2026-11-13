@@ -23,10 +23,10 @@ from langchain_openai import ChatOpenAI
 
 from AI.context import ContextManager
 from AI.causality import check_causality
+from AI.embeddings import semantic_similarity
 from AI.evaluator import VerificationError, verify_tool_execution
 from AI.faithfulness import check_faithfulness
-from AI.models.message import CausalResult, FaithfulnessResult, StepResult, ToolExecutionRecord
-from AI.step_faithfulness import check_step_faithfulness
+from AI.models.message import InterstitialCheck, ToolExecution, ToolExecutionRecord
 from AI.sandbox import SandboxSession, close_sandbox, make_tools
 
 MODEL = "qwen3.5:4b"                          # or "qwen3.5:9b" until 4b is pulled
@@ -70,6 +70,29 @@ def _flatten(content) -> str:
     return ""
 
 
+def _check_interstitial(
+    prev_executions: list[ToolExecution], reasoning: str,
+) -> InterstitialCheck:
+    outputs = [t.tool_output for t in prev_executions if t.tool_output]
+    if not outputs:
+        return InterstitialCheck(semantic_score=1.0, faithful=True)
+    combined_output = " | ".join(outputs)
+    score = semantic_similarity(combined_output, reasoning)
+    carried: list[str] = []
+    for t in prev_executions:
+        for token in t.tool_output.split():
+            if len(token) >= 3 and token in reasoning:
+                carried.append(token)
+                break
+    faithful = score >= 0.25 or len(carried) > 0
+    detail = ""
+    if not faithful:
+        detail = "reasoning does not reflect preceding tool outputs"
+    return InterstitialCheck(
+        semantic_score=score, values_carried=carried, faithful=faithful, detail=detail,
+    )
+
+
 async def _run_tool_call(call: dict, tools_by_name: dict[str, BaseTool]) -> ToolMessage:
     """Execute one parsed tool call, verify HMAC, return ToolMessage."""
     t = tools_by_name.get(call["name"])
@@ -111,7 +134,8 @@ async def stream_reply(
 
     messages: list[BaseMessage] = [SystemMessage(system), *managed_history, HumanMessage(message)]
     new_start = 1 + len(managed_history)
-    execution_records: list[ToolExecutionRecord] = []
+    all_records: list[ToolExecutionRecord] = []
+    prev_executions: list[ToolExecution] = []
 
     def _export():
         if turn_messages is not None:
@@ -123,7 +147,7 @@ async def stream_reply(
         tools_by_name = {t.name: t for t in tools}
         llm = _llm.bind_tools(tools)
 
-        for _ in range(MAX_TOOL_ROUNDS):
+        for _round_num in range(1, MAX_TOOL_ROUNDS + 1):
             full: AIMessageChunk | None = None
 
             async for chunk in llm.astream(messages):
@@ -144,46 +168,84 @@ async def stream_reply(
                 for c in full.invalid_tool_calls if c.get("id")
             ]
 
+            # ── Final response (no tool calls) ──────────────────────────
             if not full.tool_calls and not bad:
-                if execution_records:
+                if all_records:
                     ai_text = _flatten(full.content)
-                    faith_results = check_faithfulness(ai_text, execution_records)
-                    full.additional_kwargs["faithfulness"] = [
-                        r.model_dump() for r in faith_results
-                    ]
-                    causal_result = check_causality(execution_records)
-                    full.additional_kwargs["causality"] = causal_result.model_dump()
+                    causal = check_causality(all_records, user_message=message)
+                    full.additional_kwargs["causality"] = causal.model_dump()
 
-                    step_results = check_step_faithfulness(execution_records)
-                    if step_results:
-                        full.additional_kwargs["step_faithfulness"] = [
-                            r.model_dump() for r in step_results
-                        ]
+                    faith_by_id = check_faithfulness(ai_text, all_records)
+                    if faith_by_id:
+                        combined = next(iter(faith_by_id.values()))
+                        if len(faith_by_id) > 1:
+                            scores = [r.semantic_score for r in faith_by_id.values()]
+                            all_contained = all(r.contained for r in faith_by_id.values())
+                            all_mismatches = [m for r in faith_by_id.values() for m in r.mismatches]
+                            from AI.models.message import FaithfulnessResult
+                            combined = FaithfulnessResult(
+                                semantic_score=sum(scores) / len(scores),
+                                contained=all_contained,
+                                faithful=all_contained,
+                                mismatches=all_mismatches,
+                            )
+                        full.additional_kwargs["faithfulness"] = combined.model_dump()
 
-                    unfaithful = any(not r.faithful for r in faith_results)
+                    unfaithful = any(not r.faithful for r in faith_by_id.values())
                     if unfaithful and enforce_faithfulness:
-                        mismatches = [m for r in faith_results for m in r.mismatches]
+                        mismatches = [m for r in faith_by_id.values() for m in r.mismatches]
                         messages.append(full)
                         messages.append(HumanMessage(
                             f"Your response does not accurately reflect the tool output. "
                             f"Mismatches: {mismatches}. Please correct your answer."
                         ))
-                        execution_records.clear()
+                        all_records.clear()
+                        prev_executions.clear()
                         continue
+
                 messages.append(full)
                 _export()
                 return
 
+            # ── Intermediate round (has tool calls) ─────────────────────
+            reasoning = _flatten(full.content)
+
             messages.append(full)
             messages.extend(bad)
+
+            round_records: list[ToolExecutionRecord] = []
+            round_executions: list[ToolExecution] = []
             for call in full.tool_calls:
                 result = await _run_tool_call(call, tools_by_name)
                 record = getattr(result, "artifact", None)
                 if isinstance(record, ToolExecutionRecord):
-                    execution_records.append(record)
+                    record.tool_call_id = call.get("id")
+                    all_records.append(record)
+                    round_records.append(record)
+                    round_executions.append(ToolExecution(
+                        tool_name=record.tool_name,
+                        tool_call_id=record.tool_call_id,
+                        tool_input=record.tool_input,
+                        tool_output=record.tool_output,
+                        signature=record.signature,
+                    ))
                 if on_tool:
                     on_tool(call["name"], call["args"], str(result.content))
                 messages.append(result)
+
+            # Causality for this round's tools (cumulative records up to now)
+            causal = check_causality(all_records, user_message=message)
+            full.additional_kwargs["causality"] = causal.model_dump()
+            full.additional_kwargs["tool_executions"] = [
+                e.model_dump() for e in round_executions
+            ]
+
+            # Interstitial: does this reasoning reflect the previous round's outputs?
+            if prev_executions and reasoning:
+                interstitial = _check_interstitial(prev_executions, reasoning)
+                full.additional_kwargs["interstitial"] = interstitial.model_dump()
+
+            prev_executions = round_executions
 
         yield "\n[stopped: too many tool calls]"
         _export()
