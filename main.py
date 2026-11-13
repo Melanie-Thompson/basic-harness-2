@@ -48,7 +48,7 @@ async def chat(req: ChatRequest) -> StreamingResponse:
     turn_messages: list[BaseMessage] = []
     deltas: list[str] = []
 
-    kwargs: dict = {"history": history, "turn_messages": turn_messages}
+    kwargs: dict = {"history": history, "turn_messages": turn_messages, "session_id": _session_id}
     if req.system is not None:
         kwargs["system"] = req.system
 

@@ -5,31 +5,13 @@ from datetime import timedelta
 
 from dateutil import parser as dtparser
 
+from AI.embeddings import semantic_similarity
 from AI.models.message import FaithfulnessResult, ToolExecutionRecord
 from AI.tools import TOOL_SCHEMAS, Extractor
 
-_model = None
 _NUM_RE = re.compile(r"-?\d[\d,]*\.?\d*")
 
 SEMANTIC_THRESHOLD = 0.3
-
-
-def _get_model():
-    global _model
-    if _model is None:
-        from sentence_transformers import SentenceTransformer
-        _model = SentenceTransformer("all-MiniLM-L6-v2")
-    return _model
-
-
-def semantic_similarity(text_a: str, text_b: str) -> float:
-    model = _get_model()
-    embeddings = model.encode([text_a, text_b])
-    from torch.nn.functional import cosine_similarity
-    import torch
-    a = torch.tensor(embeddings[0])
-    b = torch.tensor(embeddings[1])
-    return cosine_similarity(a.unsqueeze(0), b.unsqueeze(0)).item()
 
 
 # ── Extractor checkers ──────────────────────────────────────────────────────

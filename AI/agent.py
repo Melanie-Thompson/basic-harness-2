@@ -21,6 +21,7 @@ from langchain_core.messages import (
 from langchain_core.tools import BaseTool
 from langchain_openai import ChatOpenAI
 
+from AI.context import ContextManager
 from AI.evaluator import VerificationError, verify_tool_execution
 from AI.faithfulness import check_faithfulness
 from AI.models.message import FaithfulnessResult, ToolExecutionRecord
@@ -88,6 +89,7 @@ async def stream_reply(
     on_tool: Callable[[str, dict, str], None] | None = None,
     turn_messages: list[BaseMessage] | None = None,
     enforce_faithfulness: bool = False,
+    session_id: str | None = None,
 ) -> AsyncIterator[str]:
     """Yield plain text deltas, running sandboxed tool calls between model turns.
 
@@ -97,8 +99,13 @@ async def stream_reply(
     If turn_messages is provided, this turn's new messages (human + AI + tool)
     are appended to it so the caller can persist them.
     """
-    messages: list[BaseMessage] = [SystemMessage(system), *(history or []), HumanMessage(message)]
-    new_start = 1 + len(history or [])
+    managed_history = history or []
+    if session_id and managed_history:
+        ctx = ContextManager(session_id)
+        managed_history = await ctx.prepare(managed_history, message)
+
+    messages: list[BaseMessage] = [SystemMessage(system), *managed_history, HumanMessage(message)]
+    new_start = 1 + len(managed_history)
     execution_records: list[ToolExecutionRecord] = []
 
     def _export():
