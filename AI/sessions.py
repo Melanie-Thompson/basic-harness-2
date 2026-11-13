@@ -14,7 +14,9 @@ from AI import redis_store
 from AI.models import (
     AIMessage,
     AnyMessage,
+    CausalResult,
     FaithfulnessResult,
+    StepResult,
     HumanMessage,
     Session,
     SystemMessage,
@@ -77,7 +79,27 @@ def _langchain_to_models(messages: list[BaseMessage]) -> list[AnyMessage]:
                     faithfulness = [FaithfulnessResult(**r) for r in raw_faith]
                 except Exception:
                     pass
-            result.append(AIMessage(content=content, tool_calls=tool_calls, faithfulness=faithfulness))
+            causality = None
+            raw_causal = getattr(msg, "additional_kwargs", {}).get("causality")
+            if raw_causal:
+                try:
+                    causality = CausalResult(**raw_causal)
+                except Exception:
+                    pass
+            step_faithfulness = None
+            raw_steps = getattr(msg, "additional_kwargs", {}).get("step_faithfulness")
+            if raw_steps:
+                try:
+                    step_faithfulness = [StepResult(**s) for s in raw_steps]
+                except Exception:
+                    pass
+            result.append(AIMessage(
+                content=content,
+                tool_calls=tool_calls,
+                faithfulness=faithfulness,
+                step_faithfulness=step_faithfulness,
+                causality=causality,
+            ))
 
         elif role == "tool":
             tool_call_id = msg.tool_call_id if hasattr(msg, "tool_call_id") else None

@@ -32,13 +32,18 @@ def _check_numeric(value: str, ai_text: str) -> bool:
     return False
 
 
+def _normalize_tz(dt):
+    """Strip timezone info so naive/aware datetimes can be compared."""
+    return dt.replace(tzinfo=None)
+
+
 def _check_temporal(value: str, ai_text: str) -> bool:
     try:
-        expected = dtparser.parse(value)
+        expected = _normalize_tz(dtparser.parse(value))
     except (ValueError, OverflowError):
         return False
     try:
-        found_dt = dtparser.parse(ai_text, fuzzy_with_tokens=True)[0]
+        found_dt = _normalize_tz(dtparser.parse(ai_text, fuzzy_with_tokens=True)[0])
         if abs(found_dt - expected) < timedelta(minutes=2):
             return True
     except (ValueError, OverflowError):

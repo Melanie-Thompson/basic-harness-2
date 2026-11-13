@@ -22,9 +22,11 @@ from langchain_core.tools import BaseTool
 from langchain_openai import ChatOpenAI
 
 from AI.context import ContextManager
+from AI.causality import check_causality
 from AI.evaluator import VerificationError, verify_tool_execution
 from AI.faithfulness import check_faithfulness
-from AI.models.message import FaithfulnessResult, ToolExecutionRecord
+from AI.models.message import CausalResult, FaithfulnessResult, StepResult, ToolExecutionRecord
+from AI.step_faithfulness import check_step_faithfulness
 from AI.sandbox import SandboxSession, close_sandbox, make_tools
 
 MODEL = "qwen3.5:4b"                          # or "qwen3.5:9b" until 4b is pulled
@@ -35,7 +37,10 @@ MAX_TOOL_ROUNDS = 5                           # stops runaway call loops on smal
 
 SYSTEM_PROMPT = (
     "You are a concise assistant. Always use the provided tools when they can help. "
-    "Never answer a question a tool could handle without calling that tool first."
+    "Never answer a question a tool could handle without calling that tool first.\n\n"
+    "IMPORTANT: When asked about the time in a specific location, you MUST first call "
+    "get_timezone_offset to look up the UTC offset, then call get_current_time with "
+    "that offset. Never guess timezone offsets — always look them up first."
 )
 
 
@@ -146,6 +151,15 @@ async def stream_reply(
                     full.additional_kwargs["faithfulness"] = [
                         r.model_dump() for r in faith_results
                     ]
+                    causal_result = check_causality(execution_records)
+                    full.additional_kwargs["causality"] = causal_result.model_dump()
+
+                    step_results = check_step_faithfulness(execution_records)
+                    if step_results:
+                        full.additional_kwargs["step_faithfulness"] = [
+                            r.model_dump() for r in step_results
+                        ]
+
                     unfaithful = any(not r.faithful for r in faith_results)
                     if unfaithful and enforce_faithfulness:
                         mismatches = [m for r in faith_results for m in r.mismatches]

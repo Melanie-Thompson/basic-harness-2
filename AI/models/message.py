@@ -1,6 +1,6 @@
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, Discriminator, Field, Tag
+from pydantic import BaseModel, Discriminator, Field, Tag, model_serializer
 
 from .meta import Meta
 
@@ -27,6 +27,21 @@ class FaithfulnessResult(BaseModel):
     mismatches: list[str] = Field(default_factory=list)
 
 
+class StepResult(BaseModel):
+    step: int
+    tool_called: str
+    preceding_tool: str
+    semantic_score: float
+    faithful: bool
+    detail: str = ""
+
+
+class CausalResult(BaseModel):
+    valid: bool
+    tool_sequence: list[str]
+    violations: list[str] = Field(default_factory=list)
+
+
 class Message(Meta):
     role: str
     content: str
@@ -40,6 +55,21 @@ class AIMessage(Message):
     role: Literal["ai"] = "ai"
     tool_calls: list[ToolCall] | None = None
     faithfulness: list[FaithfulnessResult] | None = None
+    step_faithfulness: list[StepResult] | None = None
+    causality: CausalResult | None = None
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler: Any) -> dict[str, Any]:
+        d = handler(self)
+        if not self.tool_calls:
+            d.pop("tool_calls", None)
+        if not self.faithfulness:
+            d.pop("faithfulness", None)
+        if not self.step_faithfulness:
+            d.pop("step_faithfulness", None)
+        if not self.causality:
+            d.pop("causality", None)
+        return d
 
 
 class ToolMessage(Message):

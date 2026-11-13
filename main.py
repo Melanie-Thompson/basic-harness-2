@@ -1,7 +1,9 @@
 """FastAPI transport layer.  uvicorn main:app --reload --port 8001"""
 
+import asyncio
 import json
 import logging
+import sys
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -76,6 +78,35 @@ async def chat(req: ChatRequest) -> StreamingResponse:
 
     return StreamingResponse(
         events(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@app.get("/test")
+async def run_tests() -> StreamingResponse:
+    async def stream_pytest():
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, "-m", "pytest", "tests/", "-v", "-s", "--tb=short", "--no-header",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        assert proc.stdout is not None
+        while True:
+            line = await proc.stdout.readline()
+            if not line:
+                break
+            yield sse({"line": line.decode(errors="replace").rstrip()})
+
+        code = await proc.wait()
+        yield sse({"exit_code": code})
+        yield sse("[DONE]")
+
+    return StreamingResponse(
+        stream_pytest(),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
