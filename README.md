@@ -5,13 +5,20 @@ Reference implementation for Code to Agent: AI agent harness with sandboxed tool
 ## Architecture
 
 ```
-Client  ->  FastAPI (/chat SSE)  ->  LangChain tool-calling loop  ->  Ollama (qwen3.5:4b)
-                                           |                                  ^
-                                     Pydantic Monty sandbox                   |
-                                     (Rust, isolated process)           Context Manager
-                                           |                          (TDA clustering)
-                                     Tool functions                         |
-                                     (8 built-in tools)           Redis (archived clusters)
+Client  ->  FastAPI (/chat, /packages)  ->  LangChain tool-calling loop  ->  Ollama (qwen3.5:4b)
+                                                   |                                  ^
+                                             Pydantic Monty sandbox                   |
+                                             (Rust, isolated process)           Context Manager
+                                                   |                          (TDA clustering)
+                                             Tool functions                         |
+                                        (built-in + installed packages)     Redis (sessions +
+                                                   |                        archived clusters)
+                                 ┌─────────────────┼─────────────────┐
+                           Capability          Session            Package
+                           enforcement         tunnel              signing
+                        (OSAccess, env,     (mTLS, host        (Ed25519 verify
+                         fn filtering)      allowlist,          at load time)
+                                            audit log)
 ```
 
 ### Code to Agent
@@ -117,11 +124,24 @@ Built-in tools cannot be replaced or discarded. Duplicate installs are rejected 
 4. The LLM streams a response, optionally requesting tool calls
 5. Gate tools are never exposed to the model
 6. Each tool call executes inside a Pydantic Monty sandbox (Rust-based, memory-limited, time-limited)
-7. Commits with `requires_confirmation` check with the user before executing
-8. The sandbox HMAC-signs the execution (tool name + input + output) using `itsdangerous`
-9. An inline evaluator verifies the signature before the result enters the conversation
-10. Each AI message carries its own evaluation inline — intermediate messages get tool_executions + causality, the final response gets faithfulness
-11. The full conversation is persisted to Redis
+7. Capability enforcement: each tool gets a restricted virtual filesystem, environment, and function access
+8. Fetch/commit tools route through the session tunnel (mTLS, host allowlisting, audit logging)
+9. Commits with `requires_confirmation` check with the user before executing
+10. The sandbox HMAC-signs the execution (tool name + input + output) using `itsdangerous`
+11. An inline evaluator verifies the signature before the result enters the conversation
+12. Each AI message carries its own evaluation inline — intermediate messages get tool_executions + causality + interstitial, the final response gets faithfulness
+13. The full conversation is persisted to Redis
+14. On session end: all tunnels close, all external packages are discarded
+
+### Package installation (runtime)
+
+1. API owner signs the tool package (definition + source) with their Ed25519 private key
+2. Package arrives at `POST /packages/install` with the definition, source code, and signature
+3. Harness verifies the signature against trusted keys (or trust-on-first-use)
+4. Source code is compiled and the callable is extracted
+5. Declared capabilities are inspected (paths exist, env vars set, no illegal claims)
+6. Tool is registered into the live `PackageRegistry` and available on the next turn
+7. On session end or `DELETE /packages/{name}`: tool is removed from the registry
 
 ### Verification pipeline
 
@@ -273,21 +293,44 @@ Returns all tool definitions in Code-to-Agent format (gates excluded).
 curl http://localhost:8000/tools | python -m json.tool
 ```
 
-```json
-{
-  "tools": [
-    {
-      "name": "calculator",
-      "description": "Evaluate a basic arithmetic expression...",
-      "inputSchema": {"properties": {"expression": {"type": "string"}}},
-      "kind": "processor",
-      "placement": "local",
-      "capabilities": [],
-      "requires_confirmation": false
+### POST /packages/install
+
+Install a tool package at runtime. The request carries the definition, source code, and optional Ed25519 signature:
+
+```bash
+curl -X POST http://localhost:8000/packages/install \
+  -H "Content-Type: application/json" \
+  -d '{
+    "definition": {
+      "name": "weather_fetch",
+      "description": "Get current weather for a city",
+      "inputSchema": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]},
+      "kind": "fetch",
+      "placement": "remote",
+      "capabilities": [{"kind": "network", "target": "api.weather.example.com"}]
+    },
+    "source_code": "def weather_fetch(city: str) -> str:\n    return f\"Sunny in {city}\"\n",
+    "publisher": "weather-api.example.com",
+    "signature": {
+      "publisher": "weather-api.example.com",
+      "public_key": "-----BEGIN PUBLIC KEY-----\n...",
+      "signature": "base64-encoded-ed25519-signature",
+      "payload_hash": "sha256-of-canonical-payload"
     }
-  ]
-}
+  }'
 ```
+
+### GET /packages
+
+List all installed packages with their status, publisher, and verification info.
+
+### GET /packages/{name}
+
+Inspect a single installed package.
+
+### DELETE /packages/{name}
+
+Discard an installed package (built-in tools are protected).
 
 ### GET /test
 
@@ -372,7 +415,10 @@ Each tool definition extends MCP's tool schema with:
 | `kind` | `gate\|fetch\|processor\|commit` | Function kind (gates are never exposed to the model) |
 | `placement` | `local\|remote` | Where the code runs |
 | `capabilities` | array | Declared runtime needs (network, filesystem, env, subprocess) |
+| `tunnel` | object (optional) | Session tunnel config: `base_url`, `allowed_hosts`, `auth_header`, `auth_env_var`, TLS cert paths |
 | `requires_confirmation` | boolean | Whether the harness must get user approval before executing |
+| `signature` | PackageSignature (optional) | Ed25519 signature from the publisher, verified at load time |
+| `source_code` | string (optional) | Tool source code, used for signature verification |
 
 ### Evaluation results on AI messages
 
@@ -422,6 +468,8 @@ Archived context clusters are stored under `context:clusters:{uuid}` with the sa
 | `langchain-core`, `langchain-openai` | LLM interaction and tool-calling |
 | `pydantic-monty` | Rust-based sandboxed Python interpreter |
 | `redis[hiredis]` | Session persistence |
+| `httpx` | Session tunnel — async HTTP client with mTLS support |
+| `cryptography` | Ed25519 key generation, package signing and verification |
 | `itsdangerous` | HMAC-signed timed tokens for tool verification |
 | `sentence-transformers` | BERT embeddings for faithfulness and context clustering |
 | `torch` | Tensor operations for embeddings |
