@@ -13,7 +13,8 @@ from pydantic import BaseModel
 
 from AI import redis_store, sessions
 from AI.agent import stream_reply
-from AI.sandbox import close_sandbox
+from AI.sandbox import close_sandbox, inspect_tools
+from AI.tools import list_tools
 
 log = logging.getLogger("agent")
 
@@ -24,6 +25,7 @@ _session_id: str = ""
 async def lifespan(_app: FastAPI):
     global _session_id
     await redis_store.connect()
+    inspect_tools()
     _session_id = sessions.new_session_id()
     log.info("session %s initialised", _session_id)
     yield
@@ -84,6 +86,12 @@ async def chat(req: ChatRequest) -> StreamingResponse:
             "X-Accel-Buffering": "no",
         },
     )
+
+
+@app.get("/tools")
+async def tools():
+    """Return tool definitions in Code-to-Agent format (gates excluded)."""
+    return {"tools": list_tools()}
 
 
 @app.get("/test")

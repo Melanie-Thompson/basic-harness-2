@@ -29,7 +29,19 @@ This harness implements the Code to Agent model: instead of calling tools on a r
 
 Gates guard, fetches read, processors think, commits act. Only processors travel.
 
-**Declared capabilities** — Each tool declares what it needs to reach (network hosts, filesystem paths, env vars). Anything undeclared is blocked by the sandbox.
+**Declared capabilities** (`AI/capabilities.py`) — Each tool declares what it needs at runtime:
+
+| Capability | Target example | What it grants |
+|-----------|---------------|---------------|
+| `network` | `api.example.com` | Network access to that host |
+| `filesystem` | `/data/*.json` | Read access to matching paths |
+| `env` | `API_KEY` | Access to that environment variable |
+| `subprocess` | `ffmpeg` | Not supported in Monty (flagged at inspection) |
+
+Enforcement happens at three levels:
+- **OSAccess per tool**: Each tool call gets a restricted virtual filesystem (only declared paths) and environment (only declared vars). Tools with no filesystem/env capabilities get an empty sandbox.
+- **Filtered external_lookup**: Each tool can only call its own function in the sandbox — no access to other tools' code.
+- **Startup inspection**: `inspect_tools()` runs at boot, checking that declared capabilities are valid (paths exist, env vars are set, processors don't claim network access). Warnings are logged.
 
 **Placement** — Tools declare `local` or `remote`. Processors default to local. The rule: read locally, commit remotely, move whichever is smaller.
 
@@ -97,6 +109,7 @@ AI/
   context.py            TDA context manager — clustering, scoring, archival, rehydration
   embeddings.py         Shared BERT embedding singleton (all-MiniLM-L6-v2)
   tokenizer.py          Qwen tokenizer singleton for accurate token counting
+  capabilities.py       Capability enforcement — per-tool OSAccess, filtered external_lookup, inspection
   sandbox.py            Pydantic Monty pool, session management, LangChain tool wrappers
   signing.py            HMAC signing/verification via itsdangerous
   evaluator.py          Inline HMAC verification (deterministic, no LLM)
@@ -186,6 +199,30 @@ data: "[DONE]"
 |-------|------|-------------|
 | `message` | string | User message |
 | `system` | string (optional) | Override the system prompt |
+
+### GET /tools
+
+Returns all tool definitions in Code-to-Agent format (gates excluded).
+
+```bash
+curl http://localhost:8000/tools | python -m json.tool
+```
+
+```json
+{
+  "tools": [
+    {
+      "name": "calculator",
+      "description": "Evaluate a basic arithmetic expression...",
+      "inputSchema": {"properties": {"expression": {"type": "string"}}},
+      "kind": "processor",
+      "placement": "local",
+      "capabilities": [],
+      "requires_confirmation": false
+    }
+  ]
+}
+```
 
 ### GET /test
 

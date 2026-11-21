@@ -1,7 +1,13 @@
 """Pydantic Monty sandbox — pool management, per-reply sessions, and LangChain
-tool wrappers that execute host functions inside the sandbox."""
+tool wrappers that execute host functions inside the sandbox.
+
+Capability enforcement: each tool gets a restricted OSAccess and filtered
+external_lookup based on its declared capabilities. Anything undeclared is
+blocked by the sandbox runtime.
+"""
 
 import json
+import logging
 from collections.abc import Callable
 from contextlib import AsyncExitStack
 
@@ -9,9 +15,12 @@ import pydantic_monty as pm
 from langchain_core.tools import BaseTool, StructuredTool
 from pydantic import BaseModel, create_model, Field
 
+from AI.capabilities import audit_capabilities, build_external_lookup, build_os_access, check_capabilities
 from AI.models.message import ToolExecutionRecord
 from AI.signing import canonicalize_args, sign_execution
-from AI.tools import ALL_TOOLS, SANDBOX_FUNCTIONS
+from AI.tools import ALL_TOOLS, SANDBOX_FUNCTIONS, TOOLS_BY_NAME
+
+log = logging.getLogger("sandbox")
 
 MAX_TOOL_OUTPUT = 4_000
 
@@ -56,16 +65,27 @@ class SandboxSession:
         return self._session
 
     async def call(self, func_name: str, **kwargs) -> str:
-        """Call a host function by name inside the sandbox."""
+        """Call a host function by name inside the sandbox.
+
+        Each call gets a capability-restricted OSAccess and external_lookup
+        built from the tool's declared capabilities.
+        """
         session = self._session or await self._fresh()
         out = pm.CollectString(max_bytes=64 * 1024)
 
         args_str = ", ".join(f"{k}={json.dumps(v)}" for k, v in kwargs.items())
         code = f"{func_name}({args_str})"
 
+        defn = TOOLS_BY_NAME.get(func_name)
+        os_access = build_os_access(defn) if defn else None
+        ext_lookup = build_external_lookup(defn, SANDBOX_FUNCTIONS) if defn else SANDBOX_FUNCTIONS
+
         try:
             result = await session.feed_run(
-                code, external_lookup=SANDBOX_FUNCTIONS, print_callback=out
+                code,
+                external_lookup=ext_lookup,
+                print_callback=out,
+                os=os_access,
             )
         except pm.MontySyntaxError as e:
             return f"SyntaxError: {e}"
@@ -126,6 +146,26 @@ def _args_model(json_schema: dict, name: str) -> type[BaseModel]:
         else:
             fields[prop_name] = (py_type, Field(default=prop.get("default"), description=desc))
     return create_model(f"{name}_args", **fields)
+
+
+# ── Startup inspection ───────────────────────────────────────────────────────
+
+def inspect_tools() -> dict[str, list[str]]:
+    """Run pre-execution capability inspection on all tools.
+
+    Returns a dict of tool_name -> list of warnings. Tools with no warnings
+    passed inspection. Called once at startup to log any issues.
+    """
+    results: dict[str, list[str]] = {}
+    for defn in ALL_TOOLS:
+        warnings = check_capabilities(defn)
+        if warnings:
+            results[defn.name] = warnings
+            for w in warnings:
+                log.warning("tool %s: %s", defn.name, w)
+        else:
+            log.info("tool %s: capabilities OK (%s)", defn.name, audit_capabilities(defn))
+    return results
 
 
 # ── LangChain tools ─────────────────────────────────────────────────────────
