@@ -1,6 +1,6 @@
 # Basic Harness 2
 
-AI agent harness with sandboxed tool execution, cryptographic verification, and semantic faithfulness checking.
+Reference implementation for Code to Agent: AI agent harness with sandboxed tool execution, cryptographic verification, and semantic faithfulness checking.
 
 ## Architecture
 
@@ -14,18 +14,40 @@ Client  ->  FastAPI (/chat SSE)  ->  LangChain tool-calling loop  ->  Ollama (qw
                                      (8 built-in tools)           Redis (archived clusters)
 ```
 
+### Code to Agent
+
+This harness implements the Code to Agent model: instead of calling tools on a remote MCP server, the harness loads self-describing, signed tool code into a local sandbox. The key ideas:
+
+**Function kinds** — Every tool declares what kind of function it is:
+
+| Kind | What it does | Exposed to model? | Where it runs | Shipped as code? |
+|------|-------------|-------------------|---------------|-----------------|
+| `gate` | Auth, permissions, consent | No | API | No |
+| `fetch` | Reads data | Yes | API, called from sandbox | Client call only |
+| `processor` | Transforms, filters, calculates | Yes | Sandbox (local) | Yes |
+| `commit` | Writes and side effects | Yes, flagged | API, may need confirmation | Client call only |
+
+Gates guard, fetches read, processors think, commits act. Only processors travel.
+
+**Declared capabilities** — Each tool declares what it needs to reach (network hosts, filesystem paths, env vars). Anything undeclared is blocked by the sandbox.
+
+**Placement** — Tools declare `local` or `remote`. Processors default to local. The rule: read locally, commit remotely, move whichever is smaller.
+
+**Inspection before execution** — The harness checks the tool's signature, reads its declared kind and capabilities, and rejects anything outside the grant. Commits with `requires_confirmation` need explicit user approval before executing.
+
 ### Core loop
 
 1. User sends a message to `/chat`
 2. The context manager checks whether conversation history exceeds the token budget
 3. If over budget: TDA persistent homology clusters messages by topic, archives least-relevant clusters to Redis, rehydrates archived clusters that match the current query
 4. The LLM streams a response, optionally requesting tool calls
-5. Each tool call executes inside a Pydantic Monty sandbox (Rust-based, memory-limited, time-limited)
-6. The sandbox HMAC-signs the execution (tool name + input + output) using `itsdangerous`
-7. An inline evaluator verifies the signature before the result enters the conversation
-8. For multi-step tool chains, step faithfulness checks that the model correctly carried forward values between tool calls
-9. After the final AI response, the evaluation pipeline runs: BERT faithfulness (tool outputs vs response), causal ordering (dependency DAG), and step faithfulness (intermediate value carryforward)
-10. The full conversation is persisted to Redis
+5. Gate tools are never exposed to the model
+6. Each tool call executes inside a Pydantic Monty sandbox (Rust-based, memory-limited, time-limited)
+7. Commits with `requires_confirmation` check with the user before executing
+8. The sandbox HMAC-signs the execution (tool name + input + output) using `itsdangerous`
+9. An inline evaluator verifies the signature before the result enters the conversation
+10. Each AI message carries its own evaluation inline — intermediate messages get tool_executions + causality, the final response gets faithfulness
+11. The full conversation is persisted to Redis
 
 ### Verification pipeline
 
@@ -42,29 +64,30 @@ Four independent checks protect the tool-calling chain:
 - Catches: AI ignoring tool results, contradicting values, hallucinating over outputs
 - Configurable: annotate-only (default) or enforce with re-prompting
 
-**Step faithfulness checking** (`AI/step_faithfulness.py`)
-- For multi-step tool chains, verifies that each tool call's arguments are consistent with the preceding tool's output
-- Two checks per step: value carryforward (did numeric/string values transfer correctly) and semantic similarity (are the previous output and next input related)
-- Catches: model misinterpreting intermediate results, passing wrong values between chained calls (e.g. wrong timezone offset)
+**Interstitial faithfulness** (inline on intermediate AI messages)
+- Between tool-calling rounds, verifies the model's reasoning text reflects the previous round's tool outputs
+- Two checks: semantic similarity and value carryforward (did key tokens transfer)
+- Catches: model misinterpreting intermediate results, passing wrong values between chained calls
 
 **Causal ordering verification** (`AI/causality.py`)
-- Verifies tools were called in the correct dependency order as defined in `TOOL_SCHEMAS`
-- Each tool declares its `depends_on` list — the evaluator checks that all dependencies were called before the dependent tool
-- Catches: model skipping prerequisite steps (e.g. calling `get_current_time` without first looking up the timezone offset)
+- Two layers: static dependency DAG + runtime data-flow tracing
+- Static: verifies tools were called in the correct dependency order as declared in `depends_on`
+- Data-flow: traces each tool's input values back to preceding tool outputs or the user message using word-boundary-aware matching
+- Catches: model skipping prerequisite steps, ungrounded inputs, broken chains
 
 ### TDA context management (`AI/context.py`, `AI/embeddings.py`, `AI/tokenizer.py`)
 
 Manages the LLM's context window using Topological Data Analysis. Messages are embedded with BERT and clustered via Vietoris-Rips persistent homology (gudhi). The persistence diagram's H0 features (connected components) represent topic clusters — the epsilon threshold is chosen adaptively from the largest gap in H0 death times.
 
-**Clustering**: Each turn, all active messages are embedded and fed into a Vietoris-Rips filtration. Connected components at the chosen epsilon form topic clusters. Cluster membership is recomputed every turn — it's a property of the current point cloud, not stored on messages.
+**Clustering**: Each turn, all active messages are embedded and fed into a Vietoris-Rips filtration. Connected components at the chosen epsilon form topic clusters. Cluster membership is recomputed every turn.
 
-**Scoring**: Each cluster's centroid is compared to the current query via cosine similarity. Higher-scoring clusters are more relevant to the user's current question.
+**Scoring**: Each cluster's centroid is compared to the current query via cosine similarity.
 
-**Budget packing**: A greedy knapsack packs the highest-scoring clusters into the token budget (default 32K, configurable via `CONTEXT_MAX_TOKENS` env var). Token counting uses the Qwen tokenizer for accuracy.
+**Budget packing**: Greedy knapsack packs highest-scoring clusters into the token budget (default 32K, configurable via `CONTEXT_MAX_TOKENS`).
 
-**Archival**: Clusters that don't fit are archived to Redis as frozen snapshots containing the centroid embedding, serialized messages, and pre-computed token count. Key format: `context:clusters:{session_id}`.
+**Archival**: Overflow clusters are archived to Redis as frozen snapshots. Key format: `context:clusters:{session_id}`.
 
-**Rehydration**: Before clustering, archived cluster centroids are compared to the current query. If cosine similarity exceeds the rehydration threshold (0.5), those clusters' messages rejoin the active set and participate in the new clustering pass. Old topics resurface naturally when the user brings them up again.
+**Rehydration**: Before clustering, archived cluster centroids are compared to the current query. If similarity exceeds the threshold (0.5), those clusters rejoin the active set.
 
 ## Project structure
 
@@ -78,26 +101,24 @@ AI/
   signing.py            HMAC signing/verification via itsdangerous
   evaluator.py          Inline HMAC verification (deterministic, no LLM)
   faithfulness.py       BERT semantic similarity + per-tool extractor checks
-  step_faithfulness.py  Intermediate step verification (value carryforward between tool calls)
-  causality.py          Causal ordering verification (tool dependency DAG)
+  causality.py          Two-layer causal evaluation (static DAG + data-flow tracing)
   redis_store.py        Redis connection lifecycle and key/value operations
   sessions.py           LangChain <-> Pydantic model conversion, Redis load/save
   models/
-    meta.py             Base model with created_at/updated_at timestamps
-    message.py          Typed message hierarchy, ToolExecutionRecord, FaithfulnessResult, StepResult, CausalResult
+    meta.py             Base model with id + created_at/updated_at timestamps
+    message.py          Typed message hierarchy, ToolExecution, FaithfulnessResult, CausalResult, InterstitialCheck
     context.py          ArchivedCluster model for persisted cluster snapshots
     session.py          Session model wrapping a message list
   tools/
-    __init__.py         Tool registries (SANDBOX_FUNCTIONS, TOOL_SCHEMAS, extractors, dependency DAG)
-    calculator.py       Arithmetic expression evaluator
-    get_timezone_offset.py  UTC offset lookup by city/IANA timezone (zoneinfo)
-    get_current_time.py     Current time with timezone offset (depends on get_timezone_offset)
-    unit_converter.py   Convert between common unit pairs
-    word_counter.py     Word/character/sentence counting
-    dice_roller.py      Standard dice notation roller (2d6, 1d20+3)
-    string_tools.py     Hash computation and base64 encoding
-tests/
-  test_context.py       TDA context management tests (real Redis, 200-message corpus)
+    definition.py       ToolDefinition model — Code-to-Agent extension of MCP tool schema
+    __init__.py         Tool registry (ALL_TOOLS, TOOLS_BY_NAME, list_tools(), compat aliases)
+    calculator.py       Arithmetic expression evaluator (processor)
+    get_timezone_offset.py  UTC offset lookup by city/IANA timezone (fetch)
+    get_current_time.py     Current time with timezone offset (fetch, depends on get_timezone_offset)
+    unit_converter.py   Convert between common unit pairs (processor)
+    word_counter.py     Word/character/sentence counting (processor)
+    dice_roller.py      Standard dice notation roller (processor)
+    string_tools.py     Hash computation and base64 encoding (processor)
 main.py                 FastAPI transport layer with SSE streaming and /test endpoint
 ```
 
@@ -174,93 +195,122 @@ Runs the test suite and streams pytest output as SSE events.
 curl -N http://localhost:8000/test
 ```
 
-Each line of pytest output is streamed as `{"line": "..."}`, followed by `{"exit_code": 0}` and `[DONE]`.
-
 ## Tools
 
 ### Built-in tools
 
-| Tool | Description | Dependencies |
-|------|-------------|-------------|
-| `calculator` | Arithmetic expression evaluator | None |
-| `get_timezone_offset` | UTC offset lookup by city name or IANA timezone | None |
-| `get_current_time` | Current date/time for a UTC offset | `get_timezone_offset` |
-| `unit_converter` | Convert between units (km/miles, kg/lbs, celsius/fahrenheit, etc.) | None |
-| `word_counter` | Count words, characters, and sentences in text | None |
-| `dice_roller` | Roll dice using standard notation (2d6, 1d20+3) | None |
-| `hash_string` | Compute cryptographic hashes (md5, sha1, sha256, sha512) | None |
-| `base64_encode` | Base64-encode a string | None |
-
-The `get_current_time` tool depends on `get_timezone_offset` — the system prompt enforces that the model must look up the offset before requesting the time. The causal evaluator verifies this ordering.
-
-The standalone tools (`unit_converter`, `word_counter`, `dice_roller`, `hash_string`, `base64_encode`) have no dependencies and generate diverse conversation topics — useful for testing TDA context clustering across multiple subject areas in a single session.
+| Tool | Kind | Description | Dependencies |
+|------|------|-------------|-------------|
+| `get_timezone_offset` | fetch | UTC offset lookup by city name or IANA timezone | None |
+| `get_current_time` | fetch | Current date/time for a UTC offset | `get_timezone_offset` |
+| `calculator` | processor | Arithmetic expression evaluator | None |
+| `unit_converter` | processor | Convert between units (km/miles, kg/lbs, celsius/fahrenheit, etc.) | None |
+| `word_counter` | processor | Count words, characters, and sentences in text | None |
+| `dice_roller` | processor | Roll dice using standard notation (2d6, 1d20+3) | None |
+| `hash_string` | processor | Compute cryptographic hashes (md5, sha1, sha256, sha512) | None |
+| `base64_encode` | processor | Base64-encode a string | None |
 
 ### Adding a new tool
 
-1. Create `AI/tools/your_tool.py` with:
-   - Input/Output Pydantic models
-   - A plain function that takes primitive args and returns a string
-   - An optional extractor function for faithfulness checking
+1. Create `AI/tools/your_tool.py`:
 
-2. Register in `AI/tools/__init__.py`:
-   ```python
-   SANDBOX_FUNCTIONS["your_tool"] = your_tool
-   TOOL_SCHEMAS["your_tool"] = {
-       "input": YourToolInput,
-       "output": YourToolOutput,
-       "extractor": your_extractor,  # optional
-       "depends_on": ["other_tool"],  # tools that must be called first
-   }
-   ```
+```python
+from pydantic import BaseModel, Field
+from .definition import ToolDefinition
 
-The tool automatically gets:
-- LangChain integration (exposed to the model)
-- Sandbox execution (isolated in Monty)
-- HMAC signing (cryptographic proof of execution)
-- Faithfulness checking (BERT + extractor verification)
-- Causal ordering verification (dependency DAG)
-- Step faithfulness (value carryforward between chained calls)
+class YourToolInput(BaseModel):
+    arg: str = Field(description="What this argument is for")
+
+def your_tool(arg: str) -> str:
+    """What the tool does — this is the description the model sees."""
+    return f"result: {arg}"
+
+def _extractor(output: str):
+    return [(output, "exact")]
+
+TOOL = ToolDefinition(
+    name="your_tool",
+    description="What the tool does.",
+    inputSchema=YourToolInput.model_json_schema(),
+    kind="processor",        # gate | fetch | processor | commit
+    placement="local",       # local | remote
+    capabilities=[],         # declared runtime needs
+    requires_confirmation=False,  # True for dangerous commits
+    fn=your_tool,
+    extractor=_extractor,
+    depends_on=[],           # tools that must be called first
+)
+```
+
+2. Import in `AI/tools/__init__.py` and add to `ALL_TOOLS`.
+
+The tool automatically gets: LangChain integration, sandbox execution, HMAC signing, faithfulness checking, causal ordering verification, and function-kind enforcement.
+
+### Tool definition format (Code to Agent)
+
+Each tool definition extends MCP's tool schema with:
+
+```json
+{
+  "name": "get_current_time",
+  "description": "Return the current date and time as ISO 8601...",
+  "inputSchema": { "properties": { "tz_offset_hours": { "type": "integer" } } },
+  "kind": "fetch",
+  "placement": "local",
+  "capabilities": [],
+  "requires_confirmation": false
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `name` | string | Tool name |
+| `description` | string | What it does — the model reads this |
+| `inputSchema` | JSON Schema | Parameter types and descriptions |
+| `kind` | `gate\|fetch\|processor\|commit` | Function kind (gates are never exposed to the model) |
+| `placement` | `local\|remote` | Where the code runs |
+| `capabilities` | array | Declared runtime needs (network, filesystem, env, subprocess) |
+| `requires_confirmation` | boolean | Whether the harness must get user approval before executing |
 
 ### Evaluation results on AI messages
 
-AI messages in Redis carry only the fields that apply:
+Each AI message carries its own evaluation inline:
 
-- **Tool-calling messages**: `tool_calls` only
-- **Final response messages**: `faithfulness`, `step_faithfulness`, `causality` (only when tools were used)
-- **Plain responses**: no extra fields
-
-Example final response with all evaluations:
+**Intermediate messages** (tool-calling rounds):
 ```json
 {
   "role": "ai",
-  "content": "The current time in New York is 2:03 PM.",
-  "faithfulness": [
-    {"tool_name": "get_timezone_offset", "semantic_score": 0.602, "faithful": true},
-    {"tool_name": "get_current_time", "semantic_score": 0.404, "faithful": true}
+  "content": "I'll look up the timezone offsets...",
+  "tool_calls": [{"name": "get_timezone_offset", "args": {"location": "Tokyo"}}],
+  "tool_executions": [
+    {"tool_name": "get_timezone_offset", "tool_call_id": "call_abc",
+     "tool_input": {"location": "Tokyo"}, "tool_output": "Asia/Tokyo UTC+9.0",
+     "signature": "eyJ0..."}
   ],
-  "step_faithfulness": [
-    {"step": 1, "tool_called": "get_current_time", "preceding_tool": "get_timezone_offset", "semantic_score": 0.401, "faithful": true}
-  ],
-  "causality": {
-    "valid": true,
-    "tool_sequence": ["get_timezone_offset", "get_current_time"],
-    "violations": []
-  }
+  "causality": {"valid": true},
+  "interstitial": {"semantic_score": 0.71, "faithful": true}
+}
+```
+
+**Final response**:
+```json
+{
+  "role": "ai",
+  "content": "The current time in Tokyo is 2026-11-13T14:03:32+09:00.",
+  "causality": {"valid": true, "data_flow": [
+    {"from_tool": "get_timezone_offset", "to_tool": "get_current_time", "values": ["9"]}
+  ]},
+  "faithfulness": {"semantic_score": 0.60, "contained": true, "faithful": true}
 }
 ```
 
 ## Session persistence
 
-Sessions are stored in Redis with a 1-hour TTL. Each session contains the full typed message history including:
-- Tool call records with HMAC signatures (`ToolExecutionRecord`)
-- Faithfulness results on AI messages (`FaithfulnessResult`)
-- Step faithfulness results for multi-step chains (`StepResult`)
-- Causal ordering results (`CausalResult`)
-- Structured tool input/output validated through Pydantic schemas
+Sessions are stored in Redis with a 1-hour TTL. Each session contains the full typed message history including tool executions with HMAC signatures, inline faithfulness and causality results, and interstitial checks between rounds.
 
 Session key format: `chat:session:{uuid}`
 
-Archived context clusters are stored separately under `context:clusters:{uuid}` with the same TTL. Each archived cluster contains its centroid embedding, serialized messages, and token count — enough to rehydrate without recomputing embeddings.
+Archived context clusters are stored under `context:clusters:{uuid}` with the same TTL.
 
 ## Dependencies
 

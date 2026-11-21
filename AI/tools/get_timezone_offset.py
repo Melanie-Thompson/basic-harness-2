@@ -58,6 +58,7 @@ TOOL = ToolDefinition(
     name="get_timezone_offset",
     description="Look up the current UTC offset for a city or IANA timezone. Call this BEFORE get_current_time to find the correct offset.",
     inputSchema=GetTimezoneOffsetInput.model_json_schema(),
+    kind="fetch",
     fn=get_timezone_offset,
     extractor=_extractor,
 )

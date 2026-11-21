@@ -22,6 +22,7 @@ TOOL = ToolDefinition(
     name="get_current_time",
     description="Return the current date and time as ISO 8601 for a given UTC offset. Use get_timezone_offset first to find the offset.",
     inputSchema=GetCurrentTimeInput.model_json_schema(),
+    kind="fetch",
     fn=get_current_time,
     extractor=_extractor,
     depends_on=["get_timezone_offset"],

@@ -130,12 +130,35 @@ def _args_model(json_schema: dict, name: str) -> type[BaseModel]:
 
 # ── LangChain tools ─────────────────────────────────────────────────────────
 
-def make_tools(sandbox: SandboxSession) -> list[BaseTool]:
-    """Create one LangChain tool per ToolDefinition, each executing inside the sandbox."""
+def make_tools(
+    sandbox: SandboxSession,
+    confirm_callback: Callable[[str, dict], bool] | None = None,
+) -> list[BaseTool]:
+    """Create one LangChain tool per ToolDefinition, each executing inside the sandbox.
+
+    Gates are never exposed to the model. Commits with requires_confirmation=True
+    call confirm_callback before executing; if it returns False the tool returns
+    an error instead of running.
+    """
     tools: list[BaseTool] = []
     for defn in ALL_TOOLS:
+        if defn.kind == "gate":
+            continue
 
-        async def _run(sandbox=sandbox, func_name=defn.name, **kwargs) -> tuple[str, ToolExecutionRecord]:
+        async def _run(
+            sandbox=sandbox,
+            func_name=defn.name,
+            _defn=defn,
+            **kwargs,
+        ) -> tuple[str, ToolExecutionRecord]:
+            if _defn.requires_confirmation and confirm_callback:
+                if not confirm_callback(func_name, kwargs):
+                    return f"error: user denied {func_name}", ToolExecutionRecord(
+                        tool_name=func_name,
+                        tool_input=kwargs,
+                        tool_output=f"error: user denied {func_name}",
+                        signature="",
+                    )
             return await sandbox.call_signed(func_name, **kwargs)
 
         tools.append(StructuredTool.from_function(

@@ -1,8 +1,8 @@
-"""Tool registry — collects MCP-conformant ToolDefinitions from each module."""
+"""Tool registry — collects Code-to-Agent ToolDefinitions from each module."""
 
 from typing import Any
 
-from .definition import Assertion, Extractor, ToolDefinition
+from .definition import Assertion, Capability, Extractor, FunctionKind, Placement, ToolDefinition
 from .calculator import TOOL as _calculator
 from .dice_roller import TOOL as _dice_roller
 from .get_current_time import TOOL as _get_current_time
@@ -25,15 +25,24 @@ ALL_TOOLS: list[ToolDefinition] = [
 TOOLS_BY_NAME: dict[str, ToolDefinition] = {t.name: t for t in ALL_TOOLS}
 
 
-def mcp_list_tools() -> list[dict[str, Any]]:
-    """Return tool definitions in MCP tools/list response format."""
+def list_tools() -> list[dict[str, Any]]:
+    """Return tool definitions in Code-to-Agent format.
+
+    Extends MCP's tools/list with kind, placement, capabilities, and
+    requires_confirmation so the harness can inspect and enforce.
+    """
     return [
         {
             "name": t.name,
             "description": t.description,
             "inputSchema": t.inputSchema,
+            "kind": t.kind,
+            "placement": t.placement,
+            "capabilities": [c.model_dump() for c in t.capabilities],
+            "requires_confirmation": t.requires_confirmation,
         }
         for t in ALL_TOOLS
+        if t.kind != "gate"  # gates are not exposed to the model
     ]
 
 
@@ -44,6 +53,7 @@ TOOL_SCHEMAS: dict[str, dict] = {
         "inputSchema": t.inputSchema,
         "extractor": t.extractor,
         "depends_on": t.depends_on,
+        "kind": t.kind,
     }
     for t in ALL_TOOLS
 }
