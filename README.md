@@ -90,6 +90,21 @@ valid = verify_package(tool_definition, source_code, sig, trusted_keys)
 
 The canonical payload is `SHA-256(definition_json) || SHA-256(source_code)` — both the contract and the implementation are covered. `inspect_tools()` runs signature verification at startup when a tool carries a `signature` and `source_code`. Unsigned tools pass (signing is opt-in until the ecosystem matures). Invalid signatures produce a warning.
 
+**Package lifecycle** (`AI/package_lifecycle.py`) — Install, inspect, and discard tool packages at runtime.
+
+The `PackageRegistry` wraps the static tool registry and adds runtime management:
+
+```
+POST /packages/install   — install a package (definition + source + optional signature)
+GET  /packages           — inspect all installed packages
+GET  /packages/{name}    — inspect a single package
+DELETE /packages/{name}  — discard a package (built-ins are protected)
+```
+
+Install flow: verify signature → compile source → register into live registry → available on next turn. Discard flow: remove from registry → disappears on next turn. All external packages are discarded when the session ends.
+
+Built-in tools cannot be replaced or discarded. Duplicate installs are rejected (discard first). Invalid signatures block installation.
+
 **Placement** — Tools declare `local` or `remote`. Processors default to local. The rule: read locally, commit remotely, move whichever is smaller.
 
 **Inspection before execution** — The harness checks the tool's signature, reads its declared kind and capabilities, and rejects anything outside the grant. Commits with `requires_confirmation` need explicit user approval before executing.
@@ -158,6 +173,7 @@ AI/
   tokenizer.py          Qwen tokenizer singleton for accurate token counting
   capabilities.py       Capability enforcement — per-tool OSAccess, filtered external_lookup, inspection
   package_signing.py    Ed25519 package signing — sign/verify tool definitions + source code
+  package_lifecycle.py  Runtime install/inspect/discard for tool packages
   tunnel.py             Session tunnel — mTLS httpx client, host allowlisting, audit logging
   sandbox.py            Pydantic Monty pool, session management, LangChain tool wrappers
   signing.py            HMAC signing/verification via itsdangerous

@@ -13,22 +13,31 @@ from pydantic import BaseModel
 
 from AI import redis_store, sessions
 from AI.agent import stream_reply
+from AI.package_lifecycle import PackageManifest, PackageRegistry
+from AI.package_signing import PackageSignature
 from AI.sandbox import close_sandbox, inspect_tools
 from AI.tools import list_tools
 
 log = logging.getLogger("agent")
 
 _session_id: str = ""
+_registry: PackageRegistry | None = None
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    global _session_id
+    global _session_id, _registry
     await redis_store.connect()
     inspect_tools()
+    _registry = PackageRegistry()
     _session_id = sessions.new_session_id()
-    log.info("session %s initialised", _session_id)
+    log.info("session %s initialised (%d tools)", _session_id, _registry.installed_count)
     yield
+    if _registry:
+        discarded = _registry.discard_all_external()
+        if discarded:
+            log.info("session end: discarded %d external packages: %s",
+                     len(discarded), discarded)
     await redis_store.close()
     await close_sandbox()
 
@@ -92,6 +101,78 @@ async def chat(req: ChatRequest) -> StreamingResponse:
 async def tools():
     """Return tool definitions in Code-to-Agent format (gates excluded)."""
     return {"tools": list_tools()}
+
+
+class InstallRequest(BaseModel):
+    definition: dict
+    source_code: str
+    publisher: str = ""
+    signature: dict | None = None
+
+
+@app.post("/packages/install")
+async def install_package(req: InstallRequest):
+    """Install a tool package into the live registry."""
+    if _registry is None:
+        return {"error": "registry not initialised"}
+
+    sig = None
+    if req.signature:
+        sig = PackageSignature(**req.signature)
+
+    manifest = PackageManifest(
+        definition=req.definition,
+        source_code=req.source_code,
+        signature=sig,
+        publisher=req.publisher,
+    )
+
+    try:
+        record = _registry.install(manifest)
+    except ValueError as e:
+        return {"error": str(e)}
+
+    return {
+        "installed": record.name,
+        "publisher": record.publisher,
+        "kind": record.kind,
+        "signature_verified": record.signature_verified,
+        "warnings": record.warnings,
+        "total_tools": _registry.installed_count,
+    }
+
+
+@app.get("/packages")
+async def list_packages():
+    """Inspect all installed packages."""
+    if _registry is None:
+        return {"error": "registry not initialised"}
+    return {"packages": _registry.inspect()}
+
+
+@app.get("/packages/{name}")
+async def inspect_package(name: str):
+    """Inspect a single installed package."""
+    if _registry is None:
+        return {"error": "registry not initialised"}
+    result = _registry.inspect(name)
+    if not result:
+        return {"error": f"package '{name}' not found"}
+    return {"package": result[0]}
+
+
+@app.delete("/packages/{name}")
+async def discard_package(name: str):
+    """Discard an installed package."""
+    if _registry is None:
+        return {"error": "registry not initialised"}
+    try:
+        removed = _registry.discard(name)
+    except ValueError as e:
+        return {"error": str(e)}
+    if not removed:
+        return {"error": f"package '{name}' not found"}
+    return {"discarded": name, "total_tools": _registry.installed_count}
 
 
 @app.get("/test")
