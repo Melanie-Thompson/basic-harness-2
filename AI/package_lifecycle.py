@@ -62,39 +62,21 @@ class PackageRegistry:
     """
 
     def __init__(self, trusted_keys: dict[str, str] | None = None):
-        from AI.tools import ALL_TOOLS
-
         self._trusted_keys = trusted_keys or {}
         self._installed: dict[str, InstalledPackage] = {}
         self._tools: dict[str, ToolDefinition] = {}
         self._functions: dict[str, callable] = {}
         self._builtin_names: set[str] = set()
 
-        for defn in ALL_TOOLS:
-            self._tools[defn.name] = defn
-            self._functions[defn.name] = defn.fn
-            self._builtin_names.add(defn.name)
-            self._installed[defn.name] = InstalledPackage(
-                name=defn.name,
-                publisher="builtin",
-                kind=defn.kind,
-                placement=defn.placement,
-                signature_verified=True,
-                builtin=True,
-            )
-
     def install(self, manifest: PackageManifest) -> InstalledPackage:
-        """Install a tool package into the live registry.
+        """Register a tool definition from the API server.
 
-        Raises ValueError if the signature is invalid or the source can't compile.
-        Returns the InstalledPackage record on success.
+        No code is compiled or executed — the harness is a portal to the API.
+        Tool calls are routed to the API's execute endpoint at runtime.
         """
         name = manifest.definition.get("name", "")
         if not name:
             raise ValueError("package definition must have a name")
-
-        if name in self._builtin_names:
-            raise ValueError(f"cannot replace built-in tool '{name}'")
 
         if name in self._tools:
             raise ValueError(f"tool '{name}' is already installed — discard it first")
@@ -115,23 +97,6 @@ class PackageRegistry:
             log.info("package '%s': signature verified (publisher: %s)",
                      name, manifest.signature.publisher)
 
-        try:
-            namespace: dict[str, Any] = {}
-            exec(compile(manifest.source_code, f"<package:{name}>", "exec"), namespace)  # noqa: S102
-        except SyntaxError as e:
-            raise ValueError(f"source code for '{name}' has syntax errors: {e}") from e
-
-        fn = namespace.get(name)
-        if fn is None:
-            available = [k for k in namespace if callable(namespace[k]) and not k.startswith("_")]
-            if len(available) == 1:
-                fn = namespace[available[0]]
-            else:
-                raise ValueError(
-                    f"source code for '{name}' must define a function named '{name}' "
-                    f"(found: {available})"
-                )
-
         defn = manifest.definition
         capabilities = [
             Capability(**c) if isinstance(c, dict) else c
@@ -146,13 +111,13 @@ class PackageRegistry:
             description=defn.get("description", ""),
             inputSchema=defn.get("inputSchema", {"type": "object", "properties": {}}),
             kind=defn.get("kind", "processor"),
-            placement=defn.get("placement", "local"),
+            placement=defn.get("placement", "remote"),
             capabilities=capabilities,
             tunnel=tunnel,
             requires_confirmation=defn.get("requires_confirmation", False),
             signature=manifest.signature,
             source_code=manifest.source_code,
-            fn=fn,
+            fn=lambda **_: None,
             depends_on=defn.get("depends_on", []),
         )
 
@@ -162,7 +127,7 @@ class PackageRegistry:
                 log.warning("package '%s': %s", name, w)
 
         self._tools[name] = tool_defn
-        self._functions[name] = fn
+        self._functions[name] = tool_defn.fn
         record = InstalledPackage(
             name=name,
             publisher=manifest.signature.publisher if manifest.signature else manifest.publisher,
@@ -172,7 +137,7 @@ class PackageRegistry:
             warnings=warnings,
         )
         self._installed[name] = record
-        log.info("package '%s' installed (kind=%s, placement=%s, verified=%s)",
+        log.info("package '%s' registered (kind=%s, placement=%s, verified=%s)",
                  name, tool_defn.kind, tool_defn.placement, sig_verified)
         return record
 

@@ -8,8 +8,11 @@ pip install langchain-openai pydantic-monty
 """
 
 import json
+import logging
 from collections.abc import AsyncIterator, Callable
 from contextlib import AsyncExitStack
+
+log = logging.getLogger("agent")
 
 from langchain_core.messages import (
     AIMessageChunk,
@@ -25,10 +28,9 @@ from AI.context import ContextManager
 from AI.causality import check_causality
 from AI.embeddings import semantic_similarity
 from AI.evaluator import VerificationError, verify_tool_execution
-from AI.faithfulness import check_faithfulness
+from AI.faithfulness import check_faithfulness, check_relevance
 from AI.models.message import InterstitialCheck, ToolExecution, ToolExecutionRecord
 from AI.sandbox import SandboxSession, close_sandbox, make_tools
-from AI.tunnel import TunnelManager
 
 MODEL = "qwen3.5:4b"                          # or "qwen3.5:9b" until 4b is pulled
 BASE_URL = "http://localhost:11434/v1"        # LM Studio: http://localhost:1234/v1
@@ -37,11 +39,9 @@ API_KEY = "ollama"                            # ignored locally, must be non-emp
 MAX_TOOL_ROUNDS = 5                           # stops runaway call loops on small models
 
 SYSTEM_PROMPT = (
-    "You are a concise assistant. Always use the provided tools when they can help. "
-    "Never answer a question a tool could handle without calling that tool first.\n\n"
-    "IMPORTANT: When asked about the time in a specific location, you MUST first call "
-    "get_timezone_offset to look up the UTC offset, then call get_current_time with "
-    "that offset. Never guess timezone offsets — always look them up first."
+    "You are a tool-first assistant. Every response MUST begin with a tool call. "
+    "Interpret every user message as an instruction to call the most relevant tool. "
+    "After receiving tool results, give a concise answer based solely on those results."
 )
 
 
@@ -117,9 +117,10 @@ async def stream_reply(
     history: list[BaseMessage] | None = None,
     on_tool: Callable[[str, dict, str], None] | None = None,
     turn_messages: list[BaseMessage] | None = None,
-    enforce_faithfulness: bool = False,
+    enforce_faithfulness: bool = True,
     session_id: str | None = None,
-) -> AsyncIterator[str]:
+    registry=None,
+) -> AsyncIterator[dict]:
     """Yield plain text deltas, running sandboxed tool calls between model turns.
 
     on_tool(name, args, result) is called after each tool runs — handy for
@@ -143,24 +144,27 @@ async def stream_reply(
             turn_messages.extend(messages[new_start:])
 
     async with AsyncExitStack() as stack:
-        tunnel_mgr = TunnelManager(session_id or "anonymous")
-        stack.push_async_callback(tunnel_mgr.close_all)
-        sandbox = SandboxSession(stack, tunnel_manager=tunnel_mgr)
-        tools = make_tools(sandbox)
+        sandbox = SandboxSession(stack, registry=registry)
+        tools = make_tools(sandbox, registry=registry)
         tools_by_name = {t.name: t for t in tools}
-        llm = _llm.bind_tools(tools)
+        has_tools = bool(tools)
+        llm_forced = _llm.bind_tools(tools, tool_choice="required") if has_tools else _llm.bind_tools(tools)
+        llm_auto = _llm.bind_tools(tools)
+        grounded = not has_tools
 
         for _round_num in range(1, MAX_TOOL_ROUNDS + 1):
+            llm = llm_auto if grounded else llm_forced
             full: AIMessageChunk | None = None
 
             async for chunk in llm.astream(messages):
                 full = chunk if full is None else full + chunk
 
-                text = _flatten(chunk.content)
-                if not text:
-                    text = chunk.additional_kwargs.get("reasoning_content", "")
-                if text:
-                    yield text
+                if grounded:
+                    text = _flatten(chunk.content)
+                    if not text:
+                        text = chunk.additional_kwargs.get("reasoning_content", "")
+                    if text:
+                        yield {"type": "token", "token": text}
 
             if full is None:
                 _export()
@@ -173,6 +177,14 @@ async def stream_reply(
 
             # ── Final response (no tool calls) ──────────────────────────
             if not full.tool_calls and not bad:
+                if not grounded:
+                    messages.append(full)
+                    messages.append(HumanMessage(
+                        "You MUST use at least one tool before answering. "
+                        "Do not answer from your own knowledge — call a tool first."
+                    ))
+                    continue
+
                 if all_records:
                     ai_text = _flatten(full.content)
                     causal = check_causality(all_records, user_message=message)
@@ -199,11 +211,10 @@ async def stream_reply(
                         mismatches = [m for r in faith_by_id.values() for m in r.mismatches]
                         messages.append(full)
                         messages.append(HumanMessage(
-                            f"Your response does not accurately reflect the tool output. "
-                            f"Mismatches: {mismatches}. Please correct your answer."
+                            "Your response must be based ONLY on the tool output above. "
+                            "Do not add any information from your own knowledge. "
+                            f"Mismatches found: {mismatches}. Rewrite using only tool data."
                         ))
-                        all_records.clear()
-                        prev_executions.clear()
                         continue
 
                 messages.append(full)
@@ -216,9 +227,20 @@ async def stream_reply(
             messages.append(full)
             messages.extend(bad)
 
+            # Pre-execution relevance gate: block before calling the API
+            tool_descs = {d.name: d.description for d in (registry.all_tools if registry else [])}
+            selected_tools = [call["name"] for call in full.tool_calls]
+            relevant, rel_mismatches = check_relevance(message, selected_tools, tool_descs)
+            log.info("pre-exec relevance: relevant=%s, mismatches=%s", relevant, rel_mismatches)
+            if not relevant:
+                yield {"type": "tool_blocked", "reason": "I don't have the right tools to answer that question."}
+                _export()
+                return
+
             round_records: list[ToolExecutionRecord] = []
             round_executions: list[ToolExecution] = []
             for call in full.tool_calls:
+                yield {"type": "tool_call", "tool": call["name"], "args": call["args"]}
                 result = await _run_tool_call(call, tools_by_name)
                 record = getattr(result, "artifact", None)
                 if isinstance(record, ToolExecutionRecord):
@@ -232,9 +254,13 @@ async def stream_reply(
                         tool_output=record.tool_output,
                         signature=record.signature,
                     ))
+                yield {"type": "tool_result", "tool": call["name"], "result": str(result.content)[:2000]}
                 if on_tool:
                     on_tool(call["name"], call["args"], str(result.content))
                 messages.append(result)
+
+            if round_records:
+                grounded = True
 
             # Causality for this round's tools (cumulative records up to now)
             causal = check_causality(all_records, user_message=message)
@@ -250,7 +276,7 @@ async def stream_reply(
 
             prev_executions = round_executions
 
-        yield "\n[stopped: too many tool calls]"
+        yield {"type": "token", "token": "\n[stopped: too many tool calls]"}
         _export()
 
 

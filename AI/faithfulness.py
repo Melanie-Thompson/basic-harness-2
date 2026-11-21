@@ -1,4 +1,13 @@
-"""Response faithfulness checker — BERT semantic similarity + per-tool extractors."""
+"""Response faithfulness checker — BERT semantic similarity + per-tool extractors.
+
+Three checks:
+1. Relevance — is the tool output relevant to what the user asked?
+2. Faithfulness — does the AI's answer match the tool output?
+3. Extractors — do specific values from the tool output appear in the answer?
+
+If the tool output isn't relevant to the question, the response is rejected
+regardless of whether the answer faithfully reflects the tool output.
+"""
 
 import re
 from datetime import timedelta
@@ -12,9 +21,7 @@ from AI.tools import TOOL_SCHEMAS, Extractor
 _NUM_RE = re.compile(r"-?\d[\d,]*\.?\d*")
 
 SEMANTIC_THRESHOLD = 0.3
-
-
-# ── Extractor checkers ──────────────────────────────────────────────────────
+RELEVANCE_THRESHOLD = 0.35
 
 
 def _check_numeric(value: str, ai_text: str) -> bool:
@@ -33,7 +40,6 @@ def _check_numeric(value: str, ai_text: str) -> bool:
 
 
 def _normalize_tz(dt):
-    """Strip timezone info so naive/aware datetimes can be compared."""
     return dt.replace(tzinfo=None)
 
 
@@ -71,7 +77,43 @@ _CHECKERS = {
 }
 
 
-# ── Main entry point ────────────────────────────────────────────────────────
+import logging as _logging
+
+_log = _logging.getLogger("faithfulness")
+
+
+def check_relevance(
+    user_message: str,
+    tool_names: list[str],
+    tool_descriptions: dict[str, str],
+) -> tuple[bool, list[str]]:
+    """Check if the selected tools are relevant to the user's question.
+
+    Compares the user's question against each tool's description
+    (what the tool does), not its output (which the LLM can game by
+    choosing arguments that lexically overlap with the question).
+    """
+    if not tool_names or not user_message:
+        return True, []
+
+    mismatches = []
+    for name in tool_names:
+        desc = tool_descriptions.get(name, "")
+        if not desc:
+            mismatches.append(f"tool '{name}' has no description — cannot verify relevance")
+            continue
+
+        score = semantic_similarity(user_message, desc)
+        _log.info("relevance: '%s' vs tool '%s' desc → %.3f (threshold %.2f)",
+                   user_message[:60], name, score, RELEVANCE_THRESHOLD)
+        if score < RELEVANCE_THRESHOLD:
+            mismatches.append(
+                f"tool '{name}' ({desc[:60]}) not relevant to question "
+                f"(similarity {score:.3f} < {RELEVANCE_THRESHOLD})"
+            )
+
+    relevant = len(mismatches) == 0
+    return relevant, mismatches
 
 
 def check_faithfulness(
@@ -82,22 +124,24 @@ def check_faithfulness(
     results: dict[str | None, FaithfulnessResult] = {}
 
     for record in records:
-        schema = TOOL_SCHEMAS.get(record.tool_name)
-        extractor: Extractor | None = schema.get("extractor") if schema else None
-
-        if extractor is None:
-            continue
-
         score = semantic_similarity(record.tool_output, ai_text)
 
         contained = True
         mismatches: list[str] = []
 
-        for value, kind in extractor(record.tool_output):
-            checker = _CHECKERS.get(kind, _check_exact)
-            if not checker(value, ai_text):
+        schema = TOOL_SCHEMAS.get(record.tool_name)
+        extractor: Extractor | None = schema.get("extractor") if schema else None
+
+        if extractor is not None:
+            for value, kind in extractor(record.tool_output):
+                checker = _CHECKERS.get(kind, _check_exact)
+                if not checker(value, ai_text):
+                    contained = False
+                    mismatches.append(f"{kind}:{value}")
+        else:
+            if score < SEMANTIC_THRESHOLD:
                 contained = False
-                mismatches.append(f"{kind}:{value}")
+                mismatches.append(f"semantic:{score:.2f}<{SEMANTIC_THRESHOLD}")
 
         results[record.tool_call_id] = FaithfulnessResult(
             semantic_score=score,
