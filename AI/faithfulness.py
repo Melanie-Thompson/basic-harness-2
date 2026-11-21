@@ -20,7 +20,7 @@ from AI.tools import TOOL_SCHEMAS, Extractor
 
 _NUM_RE = re.compile(r"-?\d[\d,]*\.?\d*")
 
-SEMANTIC_THRESHOLD = 0.3
+SEMANTIC_THRESHOLD = 0.4
 RELEVANCE_THRESHOLD = 0.25
 
 

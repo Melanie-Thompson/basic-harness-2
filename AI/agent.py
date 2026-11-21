@@ -9,6 +9,7 @@ pip install langchain-openai pydantic-monty
 
 import json
 import logging
+import random
 from collections.abc import AsyncIterator, Callable
 from contextlib import AsyncExitStack
 
@@ -40,9 +41,16 @@ MAX_TOOL_ROUNDS = 5                           # stops runaway call loops on smal
 
 SYSTEM_PROMPT = (
     "You are a tool-first assistant. Every response MUST begin with a tool call. "
-    "Interpret every user message as an instruction to call the most relevant tool. "
-    "After receiving tool results, give a concise answer based solely on those results."
+    "Interpret every user message as an instruction to call the most relevant tool.\n\n"
+    "After receiving tool results, write a helpful natural-language answer that:\n"
+    "- Presents the tool data in a clear, conversational way\n"
+    "- Uses all relevant values from the tool output (numbers, names, conditions)\n"
+    "- May rephrase, reorder, or add light commentary like 'quite warm' or 'you might want an umbrella'\n"
+    "- NEVER adds factual claims the tool did not provide (no Wikipedia facts, no history, no definitions)\n"
+    "- NEVER invents data points the tool did not return"
 )
+
+MAX_FAITHFULNESS_RETRIES = 2
 
 
 # ── Model ────────────────────────────────────────────────────────────────────
@@ -152,9 +160,11 @@ async def stream_reply(
         llm_auto = _llm.bind_tools(tools)
         grounded = not has_tools
 
+        faithfulness_retries = 0
         for _round_num in range(1, MAX_TOOL_ROUNDS + 1):
             llm = llm_auto if grounded else llm_forced
             full: AIMessageChunk | None = None
+            buffered_tokens: list[str] = []
 
             async for chunk in llm.astream(messages):
                 full = chunk if full is None else full + chunk
@@ -164,7 +174,7 @@ async def stream_reply(
                     if not text:
                         text = chunk.additional_kwargs.get("reasoning_content", "")
                     if text:
-                        yield {"type": "token", "token": text}
+                        buffered_tokens.append(text)
 
             if full is None:
                 _export()
@@ -208,15 +218,37 @@ async def stream_reply(
 
                     unfaithful = any(not r.faithful for r in faith_by_id.values())
                     if unfaithful and enforce_faithfulness:
+                        faithfulness_retries += 1
+                        if faithfulness_retries > MAX_FAITHFULNESS_RETRIES:
+                            log.warning("faithfulness retries exhausted — blocking response")
+                            deflection_prompt = [
+                                SystemMessage(
+                                    "The tool returned results but you failed to summarise them accurately. "
+                                    "Generate a brief, polite message explaining you got data but couldn't "
+                                    "summarise it reliably, and suggest the user try rephrasing. "
+                                    "Be natural and conversational. Do NOT include any tool data in your response."
+                                ),
+                                HumanMessage(message),
+                            ]
+                            deflection_response = await _llm.ainvoke(deflection_prompt)
+                            deflection_text = _flatten(deflection_response.content) or "I got results but couldn't summarise them accurately. Could you try rephrasing?"
+                            yield {"type": "tool_blocked", "reason": deflection_text}
+                            _export()
+                            return
                         mismatches = [m for r in faith_by_id.values() for m in r.mismatches]
+                        log.info("faithfulness retry %d/%d: %s", faithfulness_retries, MAX_FAITHFULNESS_RETRIES, mismatches)
                         messages.append(full)
                         messages.append(HumanMessage(
                             "Your response must be based ONLY on the tool output above. "
                             "Do not add any information from your own knowledge. "
+                            "Do not add context, definitions, or explanations the tool did not provide. "
                             f"Mismatches found: {mismatches}. Rewrite using only tool data."
                         ))
+                        buffered_tokens.clear()
                         continue
 
+                for tok in buffered_tokens:
+                    yield {"type": "token", "token": tok}
                 messages.append(full)
                 _export()
                 return
@@ -233,7 +265,23 @@ async def stream_reply(
             relevant, rel_mismatches = check_relevance(message, selected_tools, tool_descs)
             log.info("pre-exec relevance: relevant=%s, mismatches=%s", relevant, rel_mismatches)
             if not relevant:
-                yield {"type": "tool_blocked", "reason": "I don't have the right tools to answer that question."}
+                tool_names = [d.name for d in (registry.all_tools if registry else [])]
+                tool_descs = [f"{d.name}: {d.description}" for d in (registry.all_tools if registry else [])]
+                tool_info = "; ".join(tool_descs) if tool_descs else "none currently loaded"
+                deflection_prompt = [
+                    SystemMessage(
+                        "Generate a brief, polite deflection message. The user asked something "
+                        "your tools cannot help with. Mention what tools you DO have and what "
+                        "they can do. Be natural and conversational — vary your phrasing. "
+                        "Do NOT answer the user's question. Do NOT use your own knowledge. "
+                        "Just explain you can't help with that and say what you can help with.\n\n"
+                        f"Your available tools: {tool_info}"
+                    ),
+                    HumanMessage(message),
+                ]
+                deflection_response = await _llm.ainvoke(deflection_prompt)
+                deflection_text = _flatten(deflection_response.content) or "Sorry, that's outside what I can help with."
+                yield {"type": "tool_blocked", "reason": deflection_text}
                 _export()
                 return
 
@@ -276,7 +324,24 @@ async def stream_reply(
 
             prev_executions = round_executions
 
-        yield {"type": "token", "token": "\n[stopped: too many tool calls]"}
+        tool_descs = [f"{d.name}: {d.description}" for d in (registry.all_tools if registry else [])]
+        tool_info = "; ".join(tool_descs) if tool_descs else "none currently loaded"
+        deflection_prompt = [
+            SystemMessage(
+                "You tried multiple times but couldn't resolve the user's request. "
+                "Generate a brief, polite message explaining you weren't able to help "
+                "and suggest they try rephrasing. Mention what tools you have. "
+                "Be natural and conversational. Do NOT answer the user's question.\n\n"
+                f"Your available tools: {tool_info}"
+            ),
+            HumanMessage(message),
+        ]
+        try:
+            deflection_response = await _llm.ainvoke(deflection_prompt)
+            deflection_text = _flatten(deflection_response.content) or "I wasn't able to help with that. Could you try rephrasing?"
+        except Exception:
+            deflection_text = "I wasn't able to help with that. Could you try rephrasing?"
+        yield {"type": "tool_blocked", "reason": deflection_text}
         _export()
 
 
