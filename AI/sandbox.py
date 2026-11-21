@@ -17,6 +17,7 @@ from pydantic import BaseModel, create_model, Field
 
 from AI.capabilities import audit_capabilities, build_external_lookup, build_os_access, check_capabilities
 from AI.models.message import ToolExecutionRecord
+from AI.package_signing import verify_package
 from AI.signing import canonicalize_args, sign_execution
 from AI.tools import ALL_TOOLS, SANDBOX_FUNCTIONS, TOOLS_BY_NAME
 from AI.tunnel import TunnelManager, SessionTunnel
@@ -172,15 +173,49 @@ def _args_model(json_schema: dict, name: str) -> type[BaseModel]:
 
 # ── Startup inspection ───────────────────────────────────────────────────────
 
-def inspect_tools() -> dict[str, list[str]]:
-    """Run pre-execution capability inspection on all tools.
+def inspect_tools(
+    trusted_keys: dict[str, str] | None = None,
+) -> dict[str, list[str]]:
+    """Run pre-execution capability and signature inspection on all tools.
 
     Returns a dict of tool_name -> list of warnings. Tools with no warnings
     passed inspection. Called once at startup to log any issues.
+
+    If a tool carries a signature and source_code, the signature is verified
+    against trusted_keys (or trust-on-first-use if no keys are configured).
+    Unsigned tools pass — signing is opt-in until the ecosystem matures.
     """
     results: dict[str, list[str]] = {}
     for defn in ALL_TOOLS:
         warnings = check_capabilities(defn)
+
+        if defn.signature and defn.source_code:
+            defn_dict = {
+                "name": defn.name,
+                "description": defn.description,
+                "inputSchema": defn.inputSchema,
+                "kind": defn.kind,
+                "placement": defn.placement,
+                "capabilities": [c.model_dump() for c in defn.capabilities],
+                "requires_confirmation": defn.requires_confirmation,
+                "depends_on": defn.depends_on,
+            }
+            if defn.tunnel:
+                defn_dict["tunnel"] = {
+                    "base_url": defn.tunnel.base_url,
+                    "allowed_hosts": defn.tunnel.allowed_hosts,
+                }
+            if verify_package(defn_dict, defn.source_code, defn.signature, trusted_keys):
+                log.info("tool %s: signature verified (publisher: %s)",
+                         defn.name, defn.signature.publisher)
+            else:
+                warnings.append(
+                    f"SIGNATURE INVALID — publisher '{defn.signature.publisher}', "
+                    f"hash {defn.signature.payload_hash[:16]}..."
+                )
+        elif defn.signature and not defn.source_code:
+            warnings.append("signature present but source_code missing — cannot verify")
+
         if warnings:
             results[defn.name] = warnings
             for w in warnings:

@@ -76,6 +76,16 @@ class ToolDefinition(BaseModel):
         default=False,
         description="If true the harness must get user confirmation before executing"
     )
+    signature: Any = Field(
+        default=None,
+        exclude=True,
+        description="PackageSignature from the publisher (verified at load time)"
+    )
+    source_code: str | None = Field(
+        default=None,
+        exclude=True,
+        description="Source code of the tool (used for signature verification)"
+    )
     fn: Callable = Field(exclude=True)
     extractor: Extractor | None = Field(default=None, exclude=True)
     depends_on: list[str] = Field(default_factory=list)

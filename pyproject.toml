@@ -16,6 +16,7 @@ dependencies = [
     "pydantic-monty>=0.1.0",
     "redis[hiredis]>=5.0",
     "uvicorn[standard]>=0.54.0",
+    "cryptography>=50.0.2",
 ]
 
 [dependency-groups]

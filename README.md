@@ -69,6 +69,27 @@ TOOL = ToolDefinition(
 
 The harness opens the tunnel when the sandbox context starts and closes it when the session ends. Fetch and commit tools make requests through the tunnel; processors never touch the network.
 
+**Package signing** (`AI/package_signing.py`) — Ed25519 signatures verify that tool code was published by the API owner before the harness loads it.
+
+Signing (publisher side):
+```python
+from AI.package_signing import generate_keypair, sign_package
+
+private_key, public_key = generate_keypair()
+sig = sign_package(tool_definition, source_code, private_key, "weather-api.example.com")
+# Ship sig alongside the package
+```
+
+Verification (harness side):
+```python
+from AI.package_signing import verify_package
+
+trusted_keys = {"weather-api.example.com": public_key_pem}
+valid = verify_package(tool_definition, source_code, sig, trusted_keys)
+```
+
+The canonical payload is `SHA-256(definition_json) || SHA-256(source_code)` — both the contract and the implementation are covered. `inspect_tools()` runs signature verification at startup when a tool carries a `signature` and `source_code`. Unsigned tools pass (signing is opt-in until the ecosystem matures). Invalid signatures produce a warning.
+
 **Placement** — Tools declare `local` or `remote`. Processors default to local. The rule: read locally, commit remotely, move whichever is smaller.
 
 **Inspection before execution** — The harness checks the tool's signature, reads its declared kind and capabilities, and rejects anything outside the grant. Commits with `requires_confirmation` need explicit user approval before executing.
@@ -136,6 +157,7 @@ AI/
   embeddings.py         Shared BERT embedding singleton (all-MiniLM-L6-v2)
   tokenizer.py          Qwen tokenizer singleton for accurate token counting
   capabilities.py       Capability enforcement — per-tool OSAccess, filtered external_lookup, inspection
+  package_signing.py    Ed25519 package signing — sign/verify tool definitions + source code
   tunnel.py             Session tunnel — mTLS httpx client, host allowlisting, audit logging
   sandbox.py            Pydantic Monty pool, session management, LangChain tool wrappers
   signing.py            HMAC signing/verification via itsdangerous
