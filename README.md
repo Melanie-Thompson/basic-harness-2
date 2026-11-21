@@ -43,6 +43,32 @@ Enforcement happens at three levels:
 - **Filtered external_lookup**: Each tool can only call its own function in the sandbox — no access to other tools' code.
 - **Startup inspection**: `inspect_tools()` runs at boot, checking that declared capabilities are valid (paths exist, env vars are set, processors don't claim network access). Warnings are logged.
 
+**Session tunnel** (`AI/tunnel.py`) — A private, mutually authenticated channel between the sandbox and an external API that exists for one session, then closes.
+
+- **Mutual TLS**: Client cert + server cert verification when configured
+- **Short-lived keys**: Generated per session, discarded on close
+- **Host allowlisting**: Only declared network capabilities are reachable through the tunnel
+- **Request signing**: Every request carries the session ID and a sequence number
+- **Audit logging**: Every request/response is logged with method, path, status, and size
+
+Tools that need to call an external API declare a `tunnel` config in their definition:
+
+```python
+TOOL = ToolDefinition(
+    name="weather_fetch",
+    kind="fetch",
+    tunnel=TunnelConfig(
+        base_url="https://api.weather.example.com",
+        allowed_hosts=["api.weather.example.com"],
+        auth_header="Authorization",
+        auth_env_var="WEATHER_API_KEY",  # resolved at runtime, never shipped
+    ),
+    ...
+)
+```
+
+The harness opens the tunnel when the sandbox context starts and closes it when the session ends. Fetch and commit tools make requests through the tunnel; processors never touch the network.
+
 **Placement** — Tools declare `local` or `remote`. Processors default to local. The rule: read locally, commit remotely, move whichever is smaller.
 
 **Inspection before execution** — The harness checks the tool's signature, reads its declared kind and capabilities, and rejects anything outside the grant. Commits with `requires_confirmation` need explicit user approval before executing.
@@ -110,6 +136,7 @@ AI/
   embeddings.py         Shared BERT embedding singleton (all-MiniLM-L6-v2)
   tokenizer.py          Qwen tokenizer singleton for accurate token counting
   capabilities.py       Capability enforcement — per-tool OSAccess, filtered external_lookup, inspection
+  tunnel.py             Session tunnel — mTLS httpx client, host allowlisting, audit logging
   sandbox.py            Pydantic Monty pool, session management, LangChain tool wrappers
   signing.py            HMAC signing/verification via itsdangerous
   evaluator.py          Inline HMAC verification (deterministic, no LLM)

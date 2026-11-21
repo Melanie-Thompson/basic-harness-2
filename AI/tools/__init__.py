@@ -2,7 +2,7 @@
 
 from typing import Any
 
-from .definition import Assertion, Capability, Extractor, FunctionKind, Placement, ToolDefinition
+from .definition import Assertion, Capability, Extractor, FunctionKind, Placement, ToolDefinition, TunnelConfig
 from .calculator import TOOL as _calculator
 from .dice_roller import TOOL as _dice_roller
 from .get_current_time import TOOL as _get_current_time
@@ -31,8 +31,11 @@ def list_tools() -> list[dict[str, Any]]:
     Extends MCP's tools/list with kind, placement, capabilities, and
     requires_confirmation so the harness can inspect and enforce.
     """
-    return [
-        {
+    tools = []
+    for t in ALL_TOOLS:
+        if t.kind == "gate":
+            continue
+        entry = {
             "name": t.name,
             "description": t.description,
             "inputSchema": t.inputSchema,
@@ -41,9 +44,13 @@ def list_tools() -> list[dict[str, Any]]:
             "capabilities": [c.model_dump() for c in t.capabilities],
             "requires_confirmation": t.requires_confirmation,
         }
-        for t in ALL_TOOLS
-        if t.kind != "gate"  # gates are not exposed to the model
-    ]
+        if t.tunnel:
+            entry["tunnel"] = {
+                "base_url": t.tunnel.base_url,
+                "allowed_hosts": t.tunnel.allowed_hosts,
+            }
+        tools.append(entry)
+    return tools
 
 
 # Backwards-compat aliases used by sandbox.py, causality.py, faithfulness.py

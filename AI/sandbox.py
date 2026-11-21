@@ -19,6 +19,8 @@ from AI.capabilities import audit_capabilities, build_external_lookup, build_os_
 from AI.models.message import ToolExecutionRecord
 from AI.signing import canonicalize_args, sign_execution
 from AI.tools import ALL_TOOLS, SANDBOX_FUNCTIONS, TOOLS_BY_NAME
+from AI.tunnel import TunnelManager, SessionTunnel
+from AI.tunnel import TunnelConfig as RuntimeTunnelConfig
 
 log = logging.getLogger("sandbox")
 
@@ -53,9 +55,10 @@ async def close_sandbox() -> None:
 # ── Session ──────────────────────────────────────────────────────────────────
 
 class SandboxSession:
-    def __init__(self, stack: AsyncExitStack):
+    def __init__(self, stack: AsyncExitStack, tunnel_manager: TunnelManager | None = None):
         self._stack = stack
         self._session: pm.AsyncMontySession | None = None
+        self._tunnel_manager = tunnel_manager
 
     async def _fresh(self) -> pm.AsyncMontySession:
         pool = await _get_pool()
@@ -100,6 +103,25 @@ class SandboxSession:
 
         shown = "" if result is None else _to_text(result)
         return _with_stdout(out.output, shown) or "(no output)"
+
+    async def get_tunnel(self, func_name: str) -> SessionTunnel | None:
+        """Get or open a session tunnel for a tool that declares one."""
+        if self._tunnel_manager is None:
+            return None
+        defn = TOOLS_BY_NAME.get(func_name)
+        if defn is None or defn.tunnel is None:
+            return None
+        import os
+        config = RuntimeTunnelConfig(
+            base_url=defn.tunnel.base_url,
+            allowed_hosts=defn.tunnel.allowed_hosts,
+            server_cert=defn.tunnel.server_cert,
+            client_cert=defn.tunnel.client_cert,
+            client_key=defn.tunnel.client_key,
+            auth_header=defn.tunnel.auth_header,
+            auth_token=os.environ.get(defn.tunnel.auth_env_var, "") if defn.tunnel.auth_env_var else None,
+        )
+        return await self._tunnel_manager.open_tunnel(config)
 
     async def call_signed(self, func_name: str, **kwargs) -> tuple[str, ToolExecutionRecord]:
         result = await self.call(func_name, **kwargs)

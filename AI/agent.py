@@ -28,6 +28,7 @@ from AI.evaluator import VerificationError, verify_tool_execution
 from AI.faithfulness import check_faithfulness
 from AI.models.message import InterstitialCheck, ToolExecution, ToolExecutionRecord
 from AI.sandbox import SandboxSession, close_sandbox, make_tools
+from AI.tunnel import TunnelManager
 
 MODEL = "qwen3.5:4b"                          # or "qwen3.5:9b" until 4b is pulled
 BASE_URL = "http://localhost:11434/v1"        # LM Studio: http://localhost:1234/v1
@@ -142,7 +143,9 @@ async def stream_reply(
             turn_messages.extend(messages[new_start:])
 
     async with AsyncExitStack() as stack:
-        sandbox = SandboxSession(stack)
+        tunnel_mgr = TunnelManager(session_id or "anonymous")
+        stack.push_async_callback(tunnel_mgr.close_all)
+        sandbox = SandboxSession(stack, tunnel_manager=tunnel_mgr)
         tools = make_tools(sandbox)
         tools_by_name = {t.name: t for t in tools}
         llm = _llm.bind_tools(tools)
