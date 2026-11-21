@@ -233,6 +233,7 @@ async def agent_chat(req: AgentChatRequest, request: Request):
 
     async def events():
         yield sse({"conversation_id": conversation_id}, event="conversation_started")
+        yield sse({"iteration": 1}, event="thinking")
 
         current_text = ""
 
@@ -368,8 +369,7 @@ async def tda_stream(request: Request, catchup: bool = False):
         try:
             while True:
                 try:
-                    from AI.context import ContextManager
-                    snapshot = _build_tda_snapshot()
+                    snapshot = await _build_tda_snapshot()
                     yield sse(snapshot, event="topology")
                 except Exception as e:
                     yield sse({"error": str(e)}, event="error")
@@ -391,26 +391,30 @@ async def tda_stream(request: Request, catchup: bool = False):
     )
 
 
-def _build_tda_snapshot() -> dict:
+async def _build_tda_snapshot() -> dict:
     """Build a TDA topology snapshot for the frontend visualization."""
+    _empty = {"betti": [0, 0], "h0_features": [], "h1_features": [], "nodes": [], "edges": []}
     try:
         from AI.context import ContextManager
         from AI.embeddings import embed
-        import numpy as np
         import gudhi
 
-        history = asyncio.get_event_loop().run_until_complete(sessions.load(_session_id))
+        history = await sessions.load(_session_id)
         if not history or len(history) < 2:
-            return {"betti": [1, 0], "h0_features": [], "h1_features": [], "nodes": [], "edges": []}
+            return _empty
 
         texts = []
+        roles = []
+        previews = []
         for msg in history:
             content = msg.content if isinstance(msg.content, str) else str(msg.content)
             if content.strip():
                 texts.append(content)
+                roles.append(msg.type)
+                previews.append(content[:120])
 
         if len(texts) < 2:
-            return {"betti": [1, 0], "h0_features": [], "h1_features": [], "nodes": [], "edges": []}
+            return _empty
 
         embeddings = embed(texts)
 
@@ -441,13 +445,17 @@ def _build_tda_snapshot() -> dict:
                     if dim == 0 and death != float("inf"):
                         persistence = max(persistence, death - birth)
 
-            label = texts[members[0]][:40] if members else ""
+            label = texts[members[0]][:60] if members else ""
+            messages = [
+                {"idx": m, "role": roles[m], "text": previews[m]}
+                for m in members
+            ]
             nodes.append({
                 "cluster_id": i,
                 "label": label,
                 "size": len(members),
                 "persistence": round(persistence, 3),
-                "event_indices": members,
+                "messages": messages,
             })
 
         return {
@@ -459,7 +467,7 @@ def _build_tda_snapshot() -> dict:
         }
     except Exception as e:
         log.warning("TDA snapshot failed: %s", e)
-        return {"betti": [0, 0], "h0_features": [], "h1_features": [], "nodes": [], "edges": []}
+        return _empty
 
 
 # ── Original /chat endpoint (kept for backwards compat) ───────────────────

@@ -21,7 +21,7 @@ from AI.tools import TOOL_SCHEMAS, Extractor
 _NUM_RE = re.compile(r"-?\d[\d,]*\.?\d*")
 
 SEMANTIC_THRESHOLD = 0.3
-RELEVANCE_THRESHOLD = 0.35
+RELEVANCE_THRESHOLD = 0.25
 
 
 def _check_numeric(value: str, ai_text: str) -> bool:
