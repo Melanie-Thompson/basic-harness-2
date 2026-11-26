@@ -31,9 +31,11 @@ async def close_sandbox() -> None:
 class SandboxSession:
     """Routes tool calls to the API server's execute endpoint."""
 
-    def __init__(self, stack: AsyncExitStack, tunnel_manager=None, registry=None):
+    def __init__(self, stack: AsyncExitStack, tunnel_manager=None, registry=None, session_id: str = "", user_message: str = ""):
         self._stack = stack
         self._registry = registry
+        self._session_id = session_id
+        self._user_message = user_message
         self._client: httpx.AsyncClient | None = None
 
     async def _get_client(self) -> httpx.AsyncClient:
@@ -47,9 +49,14 @@ class SandboxSession:
         """Execute a tool by calling the API server. Returns (result, effects)."""
         client = await self._get_client()
         try:
+            payload: dict = {"args": kwargs}
+            if self._session_id:
+                payload["session_id"] = self._session_id
+            if self._user_message:
+                payload["user_message"] = self._user_message
             resp = await client.post(
                 f"/packages/{func_name}/execute",
-                json={"args": kwargs},
+                json=payload,
             )
             resp.raise_for_status()
             data = resp.json()

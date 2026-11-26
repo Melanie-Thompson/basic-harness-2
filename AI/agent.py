@@ -26,7 +26,6 @@ from langchain_core.tools import BaseTool
 from langchain_openai import ChatOpenAI
 
 from AI.context import ContextManager
-from AI.causality import check_causality
 from AI.embeddings import semantic_similarity
 from AI.evaluator import VerificationError, verify_tool_execution
 from AI.faithfulness import check_faithfulness, check_relevance
@@ -197,9 +196,6 @@ async def stream_reply(
 
                 if all_records:
                     ai_text = _flatten(full.content)
-                    causal = check_causality(all_records, user_message=message)
-                    full.additional_kwargs["causality"] = causal.model_dump()
-
                     faith_by_id = check_faithfulness(ai_text, all_records)
                     if faith_by_id:
                         combined = next(iter(faith_by_id.values()))
@@ -310,9 +306,6 @@ async def stream_reply(
             if round_records:
                 grounded = True
 
-            # Causality for this round's tools (cumulative records up to now)
-            causal = check_causality(all_records, user_message=message)
-            full.additional_kwargs["causality"] = causal.model_dump()
             full.additional_kwargs["tool_executions"] = [
                 e.model_dump() for e in round_executions
             ]

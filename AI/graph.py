@@ -30,7 +30,6 @@ from langgraph.graph import END, StateGraph
 from langgraph.graph.message import add_messages
 
 from AI import redis_store
-from AI.causality import check_causality
 from AI.context import ContextManager
 from AI.evaluator import VerificationError, verify_tool_execution
 from AI.faithfulness import check_faithfulness, check_relevance
@@ -308,8 +307,6 @@ def _make_evaluate_node(registry):
         if not ai_text:
             return {}
 
-        user_msg = state.get("user_message", "")
-        causal = check_causality(records, user_message=user_msg)
         faith_by_id = check_faithfulness(ai_text, records)
 
         if faith_by_id:
@@ -435,7 +432,10 @@ async def stream_reply(
     initial_count = len(initial_messages)
 
     async with AsyncExitStack() as stack:
-        sandbox = SandboxSession(stack, registry=registry)
+        sandbox = SandboxSession(
+            stack, registry=registry,
+            session_id=session_id or "", user_message=message,
+        )
         tools = make_tools(sandbox, registry=registry)
 
         graph = build_graph(tools, registry=registry)
