@@ -17,6 +17,7 @@ dependencies = [
     "redis[hiredis]>=5.0",
     "uvicorn[standard]>=0.54.0",
     "cryptography>=50.0.2",
+    "langgraph>=0.4.1",
 ]
 
 [dependency-groups]

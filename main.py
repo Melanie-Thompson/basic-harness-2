@@ -21,7 +21,8 @@ from langchain_core.messages import BaseMessage
 from pydantic import BaseModel
 
 from AI import redis_store, sessions
-from AI.agent import stream_reply
+from AI.benchmark import run_benchmark
+from AI.graph import stream_reply
 from AI.package_lifecycle import PackageManifest, PackageRegistry
 from AI.package_signing import PackageSignature
 from AI.sandbox import close_sandbox, inspect_tools
@@ -641,3 +642,51 @@ async def run_tests() -> StreamingResponse:
             "X-Accel-Buffering": "no",
         },
     )
+
+
+# ── Benchmark ──────────────────────────────────────────────────────────────
+
+_latest_benchmark: dict | None = None
+
+
+@app.post("/benchmark/run")
+async def benchmark_run():
+    """Run the benchmark suite and return results."""
+    global _latest_benchmark
+    report = await run_benchmark(
+        stream_reply,
+        registry=_registry,
+        session_id=_session_id,
+    )
+    _latest_benchmark = report.to_dict()
+
+    # Store in Redis for persistence
+    try:
+        assert redis_store._redis is not None
+        await redis_store._redis.set(
+            f"benchmark:{_session_id}",
+            json.dumps(_latest_benchmark),
+            ex=redis_store.SESSION_TTL,
+        )
+    except Exception:
+        pass
+
+    return _latest_benchmark
+
+
+@app.get("/benchmark/results")
+async def benchmark_results():
+    """Get the latest benchmark results."""
+    if _latest_benchmark:
+        return _latest_benchmark
+
+    # Try Redis
+    try:
+        assert redis_store._redis is not None
+        raw = await redis_store._redis.get(f"benchmark:{_session_id}")
+        if raw:
+            return json.loads(raw)
+    except Exception:
+        pass
+
+    return {"error": "no benchmark results available — run POST /benchmark/run first"}
