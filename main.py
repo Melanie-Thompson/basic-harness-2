@@ -690,3 +690,37 @@ async def benchmark_results():
         pass
 
     return {"error": "no benchmark results available — run POST /benchmark/run first"}
+
+
+# ── Context store ──────────────────────────────────────────────────────────
+
+@app.get("/context/tools")
+async def context_tool_results():
+    """List all tool results in the Redis context store for the current session."""
+    try:
+        results = await redis_store.list_tool_results(_session_id)
+        return {"session_id": _session_id, "results": results}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/context/tools/{call_id}")
+async def context_tool_result(call_id: str):
+    """Get a single tool result from the context store."""
+    try:
+        result = await redis_store.get_tool_result(_session_id, call_id)
+        if result is None:
+            return {"error": f"no result for call_id '{call_id}'"}
+        return result
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.delete("/context/tools")
+async def context_clear():
+    """Clear tool context for the current session."""
+    try:
+        count = await redis_store.clear_tool_context(_session_id)
+        return {"cleared": count, "session_id": _session_id}
+    except Exception as e:
+        return {"error": str(e)}

@@ -99,20 +99,35 @@ class AgentState(TypedDict, total=False):
 # ── Redis context store ────────────────────────────────────────────────────
 
 CONTEXT_STORE_PREFIX = "tool_ctx"
+CONTEXT_REF_MAX = 200
 
 
-async def _store_tool_result(session_id: str, tool_call_id: str, result: str) -> None:
+def _make_context_ref(tool_name: str, call_id: str, result_text: str) -> str:
+    """Build a compact reference for the model's context window.
+
+    The model sees a truncated preview — enough to reason about the result
+    and decide its next step, but the full output lives in Redis.
+    """
+    preview = result_text[:CONTEXT_REF_MAX]
+    if len(result_text) > CONTEXT_REF_MAX:
+        preview += f"… [{len(result_text)} chars total, stored in context:{call_id}]"
+    return preview
+
+
+async def _store_tool_result(session_id: str, tool_call_id: str, tool_name: str, result: str) -> None:
     """Write a tool result to Redis instead of keeping it in model context."""
-    key = f"{CONTEXT_STORE_PREFIX}:{session_id}:{tool_call_id}"
-    assert redis_store._redis is not None, "Redis not connected"
-    await redis_store._redis.set(key, result, ex=redis_store.SESSION_TTL)
-    log.info("stored tool result in Redis: %s (%d chars)", key, len(result))
+    if redis_store._redis is None:
+        log.warning("Redis not connected — tool result not stored")
+        return
+    await redis_store.store_tool_result(session_id, tool_call_id, tool_name, result)
+    log.info("stored tool result in Redis: %s:%s (%d chars)", session_id, tool_call_id, len(result))
 
 
 async def _load_tool_result(session_id: str, tool_call_id: str) -> str | None:
     """Load a tool result from the Redis context store."""
+    if redis_store._redis is None:
+        return None
     key = f"{CONTEXT_STORE_PREFIX}:{session_id}:{tool_call_id}"
-    assert redis_store._redis is not None, "Redis not connected"
     return await redis_store._redis.get(key)
 
 
@@ -259,19 +274,30 @@ def _make_execute_node(tools_by_name: dict[str, BaseTool], registry):
             record = None
 
         new_records = list(state.get("tool_records", []))
+        full_output = ""
         if isinstance(record, ToolExecutionRecord):
             record.tool_call_id = call.get("id")
             new_records.append(record)
+            full_output = record.tool_output
+        else:
+            full_output = str(result.content) if hasattr(result, "content") else str(result)
 
-            session_id = state.get("session_id", "")
-            if session_id:
-                await _store_tool_result(session_id, call["id"], record.tool_output)
+        # Store full result in Redis context store
+        session_id = state.get("session_id", "")
+        if session_id and full_output:
+            await _store_tool_result(session_id, call["id"], call["name"], full_output)
 
-        result_text = str(result.content)[:2000]
+        # Put a compact reference in the model's message context instead of the full output
+        result_text = str(result.content)[:2000] if hasattr(result, "content") else str(result)[:2000]
+        compact_msg = ToolMessage(
+            content=_make_context_ref(call["name"], call["id"], result_text),
+            tool_call_id=call["id"],
+        )
+
         new_events.append({"type": "tool_result", "tool": call["name"], "result": result_text})
 
         return {
-            "messages": [result],
+            "messages": [compact_msg],
             "tool_calls_pending": remaining,
             "tool_records": new_records,
             "grounded": True,
@@ -315,6 +341,7 @@ def _make_evaluate_node(registry):
                 retries = state.get("faithfulness_retries", 0) + 1
                 if retries > MAX_FAITHFULNESS_RETRIES:
                     log.warning("faithfulness retries exhausted — blocking")
+                    user_msg = state.get("user_message", "")
                     deflection_prompt = [
                         SystemMessage(
                             "The tool returned results but you failed to summarise them accurately. "
