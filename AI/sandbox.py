@@ -13,6 +13,7 @@ from langchain_core.tools import BaseTool, StructuredTool
 from pydantic import BaseModel, create_model, Field
 
 from AI.capabilities import audit_capabilities, check_capabilities
+from AI.effects import check_effects
 from AI.models.message import ToolExecutionRecord
 from AI.package_signing import verify_package
 from AI.signing import canonicalize_args, sign_execution
@@ -42,8 +43,8 @@ class SandboxSession:
             )
         return self._client
 
-    async def call(self, func_name: str, **kwargs) -> str:
-        """Execute a tool by calling the API server."""
+    async def call(self, func_name: str, **kwargs) -> tuple[str, list[dict]]:
+        """Execute a tool by calling the API server. Returns (result, effects)."""
         client = await self._get_client()
         try:
             resp = await client.post(
@@ -52,17 +53,26 @@ class SandboxSession:
             )
             resp.raise_for_status()
             data = resp.json()
+            effects = data.get("effects", [])
             if "error" in data:
-                return f"error: {data['error']}"
+                return f"error: {data['error']}", effects
             result = data.get("result", "(no output)")
             if len(result) > MAX_TOOL_OUTPUT:
                 result = result[:MAX_TOOL_OUTPUT] + f"\n…[truncated {len(result) - MAX_TOOL_OUTPUT} chars]"
-            return result
+            return result, effects
         except httpx.HTTPError as e:
-            return f"error: API call failed: {e}"
+            return f"error: API call failed: {e}", []
 
     async def call_signed(self, func_name: str, **kwargs) -> tuple[str, ToolExecutionRecord]:
-        result = await self.call(func_name, **kwargs)
+        result, effects = await self.call(func_name, **kwargs)
+
+        if effects and self._registry:
+            tool_defn = self._registry.tools_by_name.get(func_name)
+            if tool_defn:
+                allowed, violations = check_effects(tool_defn, effects)
+                if not allowed:
+                    result = f"error: blocked — undeclared effects: {'; '.join(violations)}"
+
         canonical = canonicalize_args(kwargs)
         signature = sign_execution(func_name, canonical, result)
         record = ToolExecutionRecord(

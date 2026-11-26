@@ -170,7 +170,7 @@ class OTPVerifyRequest(BaseModel):
 async def otp_send(req: OTPSendRequest):
     code = "".join(random.choices(string.digits, k=6))
     _otp_codes[req.email] = code
-    log.info("otp.dev_code", extra={"email": req.email, "code": code})
+    log.info("otp.dev_code email=%s code=******", req.email)
     # Emit as a structured log event so the frontend can auto-fill
     for q in _log_subscribers:
         try:
